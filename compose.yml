@@ -1,0 +1,36 @@
+services:
+  web:
+    image: docker.io/angeladmerkel/inosculate:${INOSCULATE_TAG:-0.1.1}
+    platform: linux/amd64
+    pull_policy: always
+    command: ["web"]
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8787}:8787"
+    environment: &app-environment
+      INGEST_DIR: /ingest
+      MOVIES_DIR: /output/movies
+      TELEVISION_DIR: /output/television
+      DATA_DIR: /data
+      # An approved cleanup is moved here, on the ingest filesystem.
+      # Set this to an empty value in an override for permanent deletion.
+      TRASH_DIR: /ingest/.inosculate-trash
+      MAKEMKV_KEY: ${MAKEMKV_KEY:-}
+      REMUX_CONCURRENCY: ${REMUX_CONCURRENCY:-1}
+      PROBE_CONCURRENCY: ${PROBE_CONCURRENCY:-3}
+      PREVIEW_CONCURRENCY: ${PREVIEW_CONCURRENCY:-2}
+      STABILITY_SECONDS: ${STABILITY_SECONDS:-30}
+    volumes: &app-volumes
+      - "${INGEST_PATH:?Set INGEST_PATH}:/ingest:rw"
+      - "${MOVIES_PATH:?Set MOVIES_PATH}:/output/movies:rw"
+      - "${TELEVISION_PATH:?Set TELEVISION_PATH}:/output/television:rw"
+      - "${APP_DATA_PATH:-./data}:/data:rw"
+
+  worker:
+    image: docker.io/angeladmerkel/inosculate:${INOSCULATE_TAG:-0.1.1}
+    platform: linux/amd64
+    pull_policy: always
+    command: ["worker"]
+    restart: unless-stopped
+    environment: *app-environment
+    volumes: *app-volumes
