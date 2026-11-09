@@ -1,38 +1,7 @@
-FROM debian:bookworm-slim AS makemkv-builder
-
-ARG MAKEMKV_VERSION=1.18.4
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-       build-essential ca-certificates curl libc6-dev libavcodec-dev libexpat1-dev \
-       libgl1-mesa-dev libssl-dev pkg-config zlib1g-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /build
-RUN curl --http1.1 --retry 5 --retry-all-errors --retry-delay 3 \
-      --connect-timeout 30 -fsSLO \
-      "https://www.makemkv.com/download/makemkv-oss-${MAKEMKV_VERSION}.tar.gz" \
-    && curl --http1.1 --retry 5 --retry-all-errors --retry-delay 3 \
-      --connect-timeout 30 -fsSLO \
-      "https://www.makemkv.com/download/makemkv-bin-${MAKEMKV_VERSION}.tar.gz" \
-    && tar -xzf "makemkv-oss-${MAKEMKV_VERSION}.tar.gz" \
-    && tar -xzf "makemkv-bin-${MAKEMKV_VERSION}.tar.gz" \
-    && cd "makemkv-oss-${MAKEMKV_VERSION}" \
-    && ./configure --disable-gui \
-    && make -j"$(nproc)" \
-    && make install DESTDIR=/stage \
-    && cd "../makemkv-bin-${MAKEMKV_VERSION}" \
-    && mkdir -p tmp \
-    && printf 'accepted\n' > tmp/eula_accepted \
-    && make -j"$(nproc)" \
-    && make install DESTDIR=/stage
-RUN mkdir -p /licenses \
-    && cp "makemkv-bin-${MAKEMKV_VERSION}/src/eula_en_linux.txt" \
-       /licenses/MakeMKV-EULA.txt \
-    && cp "makemkv-oss-${MAKEMKV_VERSION}/License.txt" \
-       /licenses/MakeMKV-OSS-License.txt \
-    && cp "makemkv-oss-${MAKEMKV_VERSION}/mmccextr/License.txt" \
-       /licenses/MakeMKV-mmccextr-License.txt
+FROM debian:trixie-slim AS disc-tools
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev libbluray-dev
+COPY native/bluray_catalog.c /src/bluray_catalog.c
+RUN cc -O2 -Wall -Wextra -o /inosculate-bluray-catalog /src/bluray_catalog.c -lbluray
 
 FROM node:22-bookworm-slim AS frontend-builder
 
@@ -45,15 +14,17 @@ COPY frontend/index.html frontend/tsconfig.json frontend/tsconfig.app.json \
 COPY frontend/src ./src
 RUN pnpm run build
 
-FROM python:3.13-slim-bookworm
+FROM python:3.13-slim-trixie
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       ca-certificates ffmpeg libexpat1 libgl1 libssl3 mkvtoolnix \
+       ffmpeg libbluray-bin lsdvd mkvtoolnix \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=makemkv-builder /stage/usr /usr
-COPY --from=makemkv-builder /licenses /usr/share/doc/makemkv
+RUN ffmpeg -hide_banner -demuxers | grep -qw dvdvideo \
+    && ffmpeg -hide_banner -protocols | grep -qw bluray
+
+COPY --from=disc-tools /inosculate-bluray-catalog /usr/local/bin/
 
 WORKDIR /app
 COPY app /app/app

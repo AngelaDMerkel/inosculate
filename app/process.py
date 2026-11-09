@@ -9,6 +9,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import BinaryIO
 
 
 ProgressCallback = Callable[[float | None, str], None]
@@ -23,14 +24,17 @@ def run_process(
     on_output: ProgressCallback,
     should_cancel: CancelCallback,
     cwd: Path | None = None,
+    stdin: BinaryIO | None = None,
 ) -> int:
     process = subprocess.Popen(
         command,
         cwd=cwd,
+        stdin=stdin,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        errors="replace",
         start_new_session=True,
     )
     output_queue: queue.Queue[str | None] = queue.Queue()
@@ -62,19 +66,12 @@ def run_process(
             match = MKVMERGE_PROGRESS.search(line)
             if match:
                 progress = float(match.group(1))
-            elif line.startswith("PRGV:"):
-                try:
-                    current, total, maximum = [
-                        int(value) for value in line[5:].split(",")[:3]
-                    ]
-                    denominator = maximum or total
-                    progress = current / denominator * 100 if denominator else None
-                except (ValueError, ZeroDivisionError):
-                    pass
             on_output(progress, line)
     finally:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
         process.wait()
+        if process.stdout:
+            process.stdout.close()
     return process.returncode
 

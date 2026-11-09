@@ -1,8 +1,14 @@
+# Set these host paths in .env or your Compose stack environment.
+x-media-volumes: &app-volumes
+  - "${INGEST_PATH:?Set INGEST_PATH to the import directory}:/ingest:rw"
+  - "${MOVIES_PATH:?Set MOVIES_PATH to the movie output directory}:/output/movies:rw"
+  - "${TELEVISION_PATH:?Set TELEVISION_PATH to the episode output directory}:/output/television:rw"
+  - "${APP_DATA_PATH:-./data}:/data:rw"
+
 services:
   web:
-    image: docker.io/angeladmerkel/inosculate:${INOSCULATE_TAG:-0.5.0}
-    platform: linux/amd64
-    pull_policy: always
+    image: ${INOSCULATE_IMAGE:-inosculate:local}
+    build: .
     command: ["web"]
     restart: unless-stopped
     ports:
@@ -15,21 +21,16 @@ services:
       # An approved cleanup is moved here, on the ingest filesystem.
       # Set this to an empty value in an override for permanent deletion.
       TRASH_DIR: /ingest/.inosculate-trash
-      MAKEMKV_KEY: ${MAKEMKV_KEY:-}
       REMUX_CONCURRENCY: ${REMUX_CONCURRENCY:-1}
       PROBE_CONCURRENCY: ${PROBE_CONCURRENCY:-3}
       PREVIEW_CONCURRENCY: ${PREVIEW_CONCURRENCY:-2}
       STABILITY_SECONDS: ${STABILITY_SECONDS:-30}
-    volumes: &app-volumes
-      - "${INGEST_PATH:?Set INGEST_PATH}:/ingest:rw"
-      - "${MOVIES_PATH:?Set MOVIES_PATH}:/output/movies:rw"
-      - "${TELEVISION_PATH:?Set TELEVISION_PATH}:/output/television:rw"
-      - "${APP_DATA_PATH:-./data}:/data:rw"
+    volumes: *app-volumes
 
   worker:
-    image: docker.io/angeladmerkel/inosculate:${INOSCULATE_TAG:-0.5.0}
-    platform: linux/amd64
-    pull_policy: always
+    image: ${INOSCULATE_IMAGE:-inosculate:local}
+    pull_policy: never
+    depends_on: [web]
     command: ["worker"]
     restart: unless-stopped
     environment: *app-environment

@@ -1,14 +1,5 @@
+# Compatibility with installations that already include this source-build override.
 services:
   web:
+    build: .
     pull_policy: build
-    build:
-      context: .
-      args:
-        MAKEMKV_VERSION: ${MAKEMKV_VERSION:-1.18.4}
-
-  worker:
-    pull_policy: build
-    build:
-      context: .
-      args:
-        MAKEMKV_VERSION: ${MAKEMKV_VERSION:-1.18.4}

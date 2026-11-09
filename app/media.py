@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import csv
 import json
 import shutil
 import subprocess
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from .catalog import resolution_class
 from .util import parse_duration
@@ -23,11 +22,11 @@ def executable(name: str) -> str:
     return found
 
 
-def run_json(command: list[str], timeout: int = 300) -> dict[str, Any]:
+def run_json(command: list[str], timeout: int = 300, stdin: BinaryIO | None = None) -> Any:
     result = subprocess.run(
-        command, capture_output=True, text=True, timeout=timeout, check=False
+        command, capture_output=True, text=True, errors="replace", stdin=stdin, timeout=timeout, check=False
     )
-    if result.returncode != 0:
+    if result.returncode != 0 and not (Path(command[0]).name == "mkvmerge" and result.returncode == 1):
         detail = (result.stderr or result.stdout).strip()
         raise MediaError(detail[-2000:] or f"Command failed: {command[0]}")
     try:
@@ -87,6 +86,7 @@ def inspect_mkvmerge(path: Path) -> dict[str, Any]:
                 "name": path.stem,
                 "duration": duration,
                 "size": path.stat().st_size,
+                "chapters": sum(c.get("num_entries", 0) for c in payload.get("chapters", [])),
                 "tracks": tracks,
                 "suggested": True,
             }
@@ -94,7 +94,7 @@ def inspect_mkvmerge(path: Path) -> dict[str, Any]:
     }
 
 
-def inspect_ffprobe(path: Path) -> dict[str, Any]:
+def inspect_ffprobe(path: Path, input_args: list[str] | None = None, stdin: BinaryIO | None = None) -> dict[str, Any]:
     payload = run_json(
         [
             executable("ffprobe"),
@@ -104,8 +104,8 @@ def inspect_ffprobe(path: Path) -> dict[str, Any]:
             "-show_streams",
             "-of",
             "json",
-            str(path),
-        ]
+            *(input_args or ["-i", str(path)]),
+        ], stdin=stdin,
     )
     tracks = []
     type_ordinals: defaultdict[str, int] = defaultdict(int)
@@ -121,6 +121,7 @@ def inspect_ffprobe(path: Path) -> dict[str, Any]:
                 "id": stream.get("index"),
                 "ordinal": ordinal,
                 "type": track_type,
+                "codec_id": stream.get("codec_name"),
                 "codec": stream.get("codec_long_name")
                 or stream.get("codec_name")
                 or "Unknown",
@@ -142,7 +143,8 @@ def inspect_ffprobe(path: Path) -> dict[str, Any]:
                 "id": "0",
                 "name": path.stem,
                 "duration": duration,
-                "size": path.stat().st_size,
+                "size": path.stat().st_size if path.is_file() else 0,
+                "reader": "ffmpeg",
                 "tracks": tracks,
                 "suggested": True,
             }
@@ -150,128 +152,15 @@ def inspect_ffprobe(path: Path) -> dict[str, Any]:
     }
 
 
-MAKEMKV_CODES = {
-    1: "type",
-    2: "name",
-    3: "language",
-    4: "language_name",
-    5: "codec_id",
-    6: "codec_short",
-    7: "codec",
-    8: "chapters",
-    9: "duration",
-    10: "size_text",
-    11: "size",
-    13: "bitrate",
-    14: "audio_channels",
-    17: "sample_rate",
-    19: "resolution",
-    20: "aspect",
-    21: "frame_rate",
-    25: "output_filename",
-}
-
-
-def makemkv_source(path: Path, kind: str) -> str:
-    if kind == "iso":
-        return f"iso:{path}"
-    return f"file:{path}"
-
-
-def inspect_makemkv(path: Path, kind: str) -> dict[str, Any]:
-    command = [
-        executable("makemkvcon"),
-        "-r",
-        "--cache=1",
-        "info",
-        makemkv_source(path, kind),
-    ]
-    result = subprocess.run(
-        command, capture_output=True, text=True, timeout=900, check=False
-    )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        raise MediaError(detail[-3000:] or "MakeMKV could not inspect this source")
-
-    title_values: defaultdict[str, dict[str, Any]] = defaultdict(dict)
-    stream_values: defaultdict[tuple[str, str], dict[str, Any]] = defaultdict(dict)
-    for line in result.stdout.splitlines():
-        if ":" not in line:
-            continue
-        prefix, encoded = line.split(":", 1)
-        if prefix not in {"TINFO", "SINFO"}:
-            continue
-        try:
-            values = next(csv.reader([encoded]))
-            if prefix == "TINFO" and len(values) >= 4:
-                title_id, code, _, value = values[:4]
-                title_values[title_id][MAKEMKV_CODES.get(int(code), f"code_{code}")] = value
-            elif prefix == "SINFO" and len(values) >= 5:
-                title_id, stream_id, code, _, value = values[:5]
-                stream_values[(title_id, stream_id)][
-                    MAKEMKV_CODES.get(int(code), f"code_{code}")
-                ] = value
-        except (ValueError, csv.Error):
-            continue
-
-    titles = []
-    for title_id, info in title_values.items():
-        tracks = []
-        type_ordinals: defaultdict[str, int] = defaultdict(int)
-        for (stream_title, stream_id), stream in stream_values.items():
-            if stream_title != title_id:
-                continue
-            track_type = _track_type(stream.get("type", "other"))
-            ordinal = type_ordinals[track_type]
-            type_ordinals[track_type] += 1
-            resolution = str(stream.get("resolution", ""))
-            width, _, height = resolution.partition("x")
-            tracks.append(
-                {
-                    "key": stream_id,
-                    "id": stream_id,
-                    "ordinal": ordinal,
-                    "type": track_type,
-                    "codec": stream.get("codec")
-                    or stream.get("codec_short")
-                    or stream.get("codec_id")
-                    or "Unknown",
-                    "language": stream.get("language", "und"),
-                    "language_name": stream.get("language_name", ""),
-                    "name": stream.get("name", ""),
-                    "default": False,
-                    "forced": "forced" in stream.get("name", "").lower(),
-                    "audio_channels": stream.get("audio_channels"),
-                    "sample_rate": stream.get("sample_rate"),
-                    "width": int(width) if width.isdigit() else None,
-                    "height": int(height) if height.isdigit() else None,
-                }
-            )
-        titles.append(
-            {
-                "id": title_id,
-                "name": info.get("name") or f"Title {int(title_id) + 1}",
-                "duration": parse_duration(info.get("duration")),
-                "size": int(info.get("size", 0) or 0),
-                "output_filename": info.get("output_filename"),
-                "tracks": tracks,
-                "suggested": False,
-            }
-        )
-
-    if not titles:
-        raise MediaError("MakeMKV found no readable titles")
-    main = max(titles, key=lambda item: (item["duration"], item["size"]))
-    main["suggested"] = True
-    titles.sort(key=lambda item: (-item["duration"], item["id"]))
-    return {"container": kind.upper(), "titles": titles}
-
-
 def inspect_source(path: Path, kind: str) -> dict[str, Any]:
     if kind in {"dvd", "bluray", "iso"}:
-        return enrich_metadata(inspect_makemkv(path, kind))
+        from .discs import catalog_disc
+
+        return catalog_disc(path, kind)
     try:
         primary = inspect_mkvmerge(path)
+        if not any(t["type"] in {"video", "audio"} for t in primary["titles"][0]["tracks"]):
+            raise MediaError("No muxable tracks found by MKVToolNix")
     except (MediaError, subprocess.TimeoutExpired):
         return enrich_metadata(inspect_ffprobe(path))
     # Some containers (notably MP4) do not expose duration or rich track

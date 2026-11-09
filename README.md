@@ -1,132 +1,65 @@
 # Inosculate
 
-Inosculate is a small, local-only web application for inspecting mixed media
-sources and remuxing selected video, audio, and subtitle tracks into MKV files.
-It understands ordinary media files, ISO images, DVD `VIDEO_TS` directories,
-and Blu-ray `BDMV` directories.
+Inosculate remuxes on-disk DVD and Blu-ray backups, movies, and television episodes into MKV files. A local web interface handles title and track selection. A separate worker reads the chosen streams and verifies each output before publishing it.
 
-## What it does
+## Run with Docker Compose
 
-- Manually scans a read/write ingest directory.
-- Builds a lightweight inventory first, then inspects tracks only when asked.
-- Treats discovered media as a decision queue: scanning never schedules work.
-- Automatically groups recognisable television episodes by series and season,
-  including common anime and loose `S01 E02` naming styles.
-- Detects exact track-layout matches within a season and can preflight one
-  episode's track choices across selected matching episodes.
-- Uses MKVToolNix, FFprobe, and MakeMKV to inspect titles and tracks.
-- Suggests the longest title as the main feature for disc sources.
-- Lets you include or exclude tracks, apply presets, and correct language/name.
-- Shows the source resolution alongside a standard 360p–2160p class.
-- Opens on-demand preview dialogs for audio and subtitle samples.
-- Generates a one-minute audio sample only when requested.
-- Generates a subtitle text snippet or representative bitmap frame on request.
-- Lists real Movies and Television library directories as destinations.
-- Guides movie and television destination naming.
-- Lets unwanted sources be deferred, moved to trash, or permanently deleted
-  before they are scheduled.
-- Runs explicitly scheduled remuxes through a persistent SQLite-backed queue.
-- Shows progress with cancellation, retry, overwrite decisions, and on-demand
-  logs that do not slow the normal queue refresh.
-- Creates a cleanup decision after a successful, validated remux so the source
-  can be kept, deferred, moved to trash, or permanently deleted.
+Copy `.env.example` to `.env` beside `compose.yml`. Set the three media paths to directories on the Docker host. Both services use the same mounts.
 
-The interface separates those states into **Queue** (sources awaiting a
-decision), **Progress** (scheduled and active work), and **Processed** (verified
-outputs awaiting an original-source decision).
-
-## Quick start
-
-Copy `.env.example` to `.env`, set the four host paths, then run:
-
-```sh
-docker compose pull
-docker compose up -d
-```
-
-Open `http://YOUR-NAS:8787`.
-
-The published x86-64 image is
-[`angeladmerkel/inosculate`](https://hub.docker.com/r/angeladmerkel/inosculate).
-Both the web and worker services use the same image with different commands.
-The default [compose.yml](compose.yml) contains no build instructions and
-pulls `docker.io/angeladmerkel/inosculate:0.5.0` directly.
-
-For a local source build instead, explicitly include the build override:
-
-```sh
-docker compose -f compose.yml -f compose.build.yml up --build -d
-```
-
-The container runs as UID `568`; grant that account read/write access to the
-ingest, Movies, Television, and app-data datasets. The web interface has no
-authentication and should not be exposed outside the trusted local network.
-
-The image expects a valid MakeMKV beta or purchased key in `MAKEMKV_KEY`.
-`MAKEMKV_VERSION` is only used when building locally with
-`compose.build.yml`; its checked-in default is `1.18.4`.
-
-## TrueNAS mounts
-
-The default Compose layout is:
-
-| Host setting | Container path | Mode |
+| Compose variable | Purpose | Container path |
 | --- | --- | --- |
-| `INGEST_PATH` | `/ingest` | read/write |
-| `MOVIES_PATH` | `/output/movies` | read/write |
-| `TELEVISION_PATH` | `/output/television` | read/write |
-| `APP_DATA_PATH` | `/data` | read/write |
+| `INGEST_PATH` | Import directory containing disc backups and existing media files | `/ingest` |
+| `MOVIES_PATH` | Movie output directory | `/output/movies` |
+| `TELEVISION_PATH` | Episode output directory | `/output/television` |
+| `APP_DATA_PATH` | Persistent database and preview files | `/data` |
 
-All values on the left are paths on the machine running Docker. For TrueNAS,
-they normally begin with `/mnt/...`. A path such as
-`/Volumes/supertanker_media/...` is a macOS SMB client mount and will produce
-an empty directory when used as a bind source on the NAS.
+For example, a TrueNAS installation can use the following host paths. Grant UID 568 read and traverse access to the import directory and write access to the output and app-data directories.
 
-In TrueNAS, open the SMB share configuration and copy its local **Path** into
-the Portainer stack environment variables. Grant UID `568` read/write and
-traverse access to the ingest and output datasets.
+```dotenv
+INGEST_PATH=/mnt/tank/media/incoming
+MOVIES_PATH=/mnt/tank/media/Movies
+TELEVISION_PATH=/mnt/tank/media/Television
+APP_DATA_PATH=/mnt/tank/apps/inosculate
+```
 
-Inventory scans do not probe media, create files in ingest, or keep source
-files open. Inspection happens only when a user expands or explicitly selects
-an item. The application never renames source media. It writes to a `.partial` file
-beside the destination, validates it, and atomically moves it into place.
-Compose defaults approved cleanup to `/ingest/.inosculate-trash`, keeping the
-move on the ingest filesystem. To make approved deletion permanent instead,
-set `TRASH_DIR` to an empty value in a local Compose override.
+```sh
+docker compose up --build -d
+```
 
-## Worker defaults
+Open `http://YOUR-NAS:8787` on your trusted local network. `WEB_PORT` changes the host port. Compose builds the image from this checkout. The service has no authentication.
 
-- 1 heavy remux
-- 3 on-demand metadata inspections
-- 2 on-demand audio/subtitle previews
+## Select a batch
 
-These are configurable through `REMUX_CONCURRENCY`, `PROBE_CONCURRENCY`, and
-`PREVIEW_CONCURRENCY`. One remux is the recommended default for a single NAS
-storage pool. Run one worker service; concurrency is managed inside it.
+1. In **Library**, scan the import folder. Open a source to inspect it, or choose **Inspect visible** to catalog the filtered list in the background.
+2. For each disc, add the titles or playlists you want. Duration and chapter count help distinguish features, episodes, and extras. Scanning and inspection leave every disc title unselected.
+3. For existing episodes or movies, select individual files or all visible files. Inspect them and choose **Review files** to add them together.
+4. In **Batch**, choose Movies or Television and a relative filename for each output. All supported tracks start selected. Use **Batch track selection** to keep particular audio or subtitle languages or drop all subtitles. Expand **Tracks** to sample audio or subtitles and remove individual streams such as commentary. When a requested audio language is missing, the previous audio choice is retained for that file.
+5. **Queue jobs** submits the whole batch. **Jobs** shows progress, errors, logs, cancellation, and retry. Each title produces its own file. The worker checks track counts and duration before publishing, and keeps the original source.
+
+## Media readers
+
+| Input | Title enumeration | Muxer |
+| --- | --- | --- |
+| DVD `VIDEO_TS` or DVD ISO | `lsdvd` reads the DVD navigation table | FFmpeg's `dvdvideo` demuxer opens the selected DVD title |
+| Blu-ray `BDMV` | libbluray lists playlists | MKVToolNix reads the selected MPLS and its referenced clips |
+| Blu-ray ISO | libbluray lists playlists inside the image | FFmpeg opens the image with the selected playlist |
+| Existing media file | MKVToolNix and FFprobe identify tracks | MKVToolNix, or FFmpeg for inputs identified by FFprobe alone |
+
+The container includes the disc readers. Inputs should be readable, decrypted backups. ISO images are read in place. No hardware drive, MakeMKV key, or full-size intermediate MKV is required. DVD and Blu-ray PCM may need lossless repacking for Matroska. Disc chapter times are read from the navigation tables and carried into the output. Short-only Blu-ray ISOs stream their selected playlist through libbluray.
+
+The worker defaults to one remux at a time. `REMUX_CONCURRENCY` and `PROBE_CONCURRENCY` control parallelism on the storage host. A failed title leaves other jobs able to continue.
+
+## Upgrading an existing installation
+
+Stop the previous services and back up the app-data directory. Use the same `APP_DATA_PATH` when starting this version. The database migration keeps completed jobs and ordinary media-file jobs. Old disc jobs with pending work appear as **needs selection**. Inspect those discs and choose their titles again because MakeMKV title numbers cannot identify native DVD titles or Blu-ray playlists reliably.
 
 ## Development
 
-The media service uses only the Python standard library. The interface is a
-React application compiled into `app/static`. To rebuild the interface, install
-the pinned frontend packages and run:
-
 ```sh
+python3 -m unittest discover -s tests
 cd frontend
-pnpm install
+pnpm install --frozen-lockfile
 pnpm run build
 ```
 
-To run the complete application without Docker, install `mkvtoolnix`, `ffmpeg`,
-and `makemkvcon`, then:
-
-```sh
-export INGEST_DIR=/path/to/ingest
-export MOVIES_DIR=/path/to/movies
-export TELEVISION_DIR=/path/to/television
-export DATA_DIR=/tmp/inosculate
-python -m app init
-python -m app worker
-python -m app web
-```
-
-The worker and web commands should run in separate terminals.
+The browser application is built into `app/static`. For native operation, use Python 3.11+, MKVToolNix, FFmpeg with the dvdvideo demuxer and bluray protocol, lsdvd, bd_splice, and libbluray. Compile `native/bluray_catalog.c` against libbluray and put the resulting `inosculate-bluray-catalog` executable on PATH. Set `INGEST_DIR`, `MOVIES_DIR`, `TELEVISION_DIR`, and `DATA_DIR` and run `python3 -m app web` and `python3 -m app worker` in separate terminals.

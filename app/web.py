@@ -15,6 +15,9 @@ from . import __version__
 from .catalog import LANGUAGES, preferences
 from .config import settings
 from .db import now, row, rows, transaction
+from .media import MediaError
+from .library import queue_inspections, reviewed_files, title_details
+from .queue import activity, _insert_prepared_job, _prepared_job, schedule_batch
 from .scanner import discover
 from .seasons import season_analysis, season_plan
 from .util import (
@@ -22,8 +25,6 @@ from .util import (
     format_duration,
     human_bytes,
     json_load,
-    safe_component,
-    safe_relative_mkv,
 )
 
 
@@ -92,118 +93,6 @@ SELECT sources.*,
 """
 
 
-def _prepared_job(source: dict, body: dict) -> dict:
-    if not source or source["probe_status"] != "ready":
-        raise ValueError("This source is not ready")
-    output_kind = body.get("output_kind")
-    if output_kind not in {"movie", "television"}:
-        raise ValueError("Choose Movies or Television")
-    relative = safe_relative_mkv(str(body.get("relative_path", "")))
-    root = (
-        settings.movies_dir if output_kind == "movie" else settings.television_dir
-    )
-    output = ensure_beneath(root / relative, root)
-    overwrite = bool(body.get("overwrite"))
-    if output.exists() and not overwrite:
-        raise FileExistsError(str(output))
-
-    metadata = json_load(source["metadata_json"], {})
-    title_id = str(body.get("title_id", "0"))
-    title = next(
-        (
-            value
-            for value in metadata.get("titles", [])
-            if str(value["id"]) == title_id
-        ),
-        None,
-    )
-    if not title:
-        raise ValueError("Selected title was not found")
-    available = {str(track["key"]) for track in title.get("tracks", [])}
-    selected = list(
-        dict.fromkeys(
-            str(value)
-            for value in body.get("selected_tracks", [])
-            if str(value) in available
-        )
-    )
-    if not selected:
-        raise ValueError("Select at least one track")
-    selected_types = {
-        track["type"]
-        for track in title.get("tracks", [])
-        if str(track["key"]) in selected
-    }
-    if not selected_types.intersection({"video", "audio"}):
-        raise ValueError("Select at least one video or audio track")
-
-    raw_overrides = body.get("track_overrides", {})
-    if not isinstance(raw_overrides, dict):
-        raise ValueError("Track overrides must be an object")
-    language_codes = {code for code, _ in LANGUAGES}
-    overrides: dict[str, dict[str, str]] = {}
-    for track_key, value in raw_overrides.items():
-        if str(track_key) not in available or not isinstance(value, dict):
-            continue
-        language = str(value.get("language", "")).strip().lower()
-        name = safe_component(str(value.get("name", "")).strip(), "")
-        if language and language not in language_codes:
-            raise ValueError(f"Unsupported track language: {language}")
-        if language or name:
-            overrides[str(track_key)] = {
-                "language": language,
-                "name": name,
-            }
-    return {
-        "source_id": int(source["id"]),
-        "title_id": title_id,
-        "output_kind": output_kind,
-        "relative_path": str(relative),
-        "output_path": str(output),
-        "selected_tracks": selected,
-        "track_overrides": overrides,
-        "overwrite": overwrite,
-    }
-
-
-def _insert_prepared_job(
-    connection: object, prepared: dict, timestamp: str
-) -> int:
-    claimed = connection.execute(
-        """
-        UPDATE sources
-           SET queue_state='scheduled', updated_at=?
-         WHERE id=? AND present=1
-           AND queue_state IN ('awaiting', 'deferred')
-        """,
-        (timestamp, prepared["source_id"]),
-    )
-    if claimed.rowcount != 1:
-        raise ValueError("This source is no longer awaiting a queue decision")
-    cursor = connection.execute(
-        """
-        INSERT INTO jobs
-            (source_id, title_id, output_kind, relative_path, output_path,
-             selected_tracks_json, track_overrides_json,
-             status, overwrite_approved, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
-        """,
-        (
-            prepared["source_id"],
-            prepared["title_id"],
-            prepared["output_kind"],
-            prepared["relative_path"],
-            prepared["output_path"],
-            json.dumps(prepared["selected_tracks"]),
-            json.dumps(prepared["track_overrides"]),
-            prepared["overwrite"],
-            timestamp,
-            timestamp,
-        ),
-    )
-    return int(cursor.lastrowid)
-
-
 class Handler(BaseHTTPRequestHandler):
     server_version = f"Inosculate/{__version__}"
 
@@ -212,10 +101,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json_body(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
-        if length > 1_000_000:
+        if length < 0 or length > 1_000_000:
             raise ValueError("Request is too large")
         raw = self.rfile.read(length) if length else b"{}"
-        return json.loads(raw)
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError("Expected a JSON object")
+        return value
 
     def _send_json(
         self, value: object, status: HTTPStatus = HTTPStatus.OK
@@ -329,6 +221,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(self._directories(kind))
             elif parts == ["api", "seasons"]:
                 self._send_json(self._season_summaries())
+            elif parts == ["api", "activity"]:
+                self._send_json(activity(int(self._query().get("history", ["50"])[0])))
+            elif parts == ["api", "library"]:
+                self._send_json(rows("""
+                    SELECT id, name, path, kind, size, mtime, probe_status, probe_error,
+                           queue_state, series_name, season_number, episode_number
+                      FROM sources WHERE present=1 AND queue_state NOT IN ('removed','trashed','deleted')
+                     ORDER BY name COLLATE NOCASE, path
+                """))
             elif parts == ["api", "sources"]:
                 self._send_json(
                     [
@@ -471,6 +372,23 @@ class Handler(BaseHTTPRequestHandler):
             parts = self._route_parts()
             if parts == ["api", "scan"]:
                 self._send_json(discover())
+            elif parts == ["api", "files", "review"]:
+                sources = reviewed_files(self._json_body().get("source_ids"))
+                self._send_json([_public_source(source) for source in sources])
+            elif parts == ["api", "inspect"]:
+                ids = self._json_body().get("source_ids")
+                if not isinstance(ids, list):
+                    raise ValueError("source_ids must be a list")
+                self._send_json({"queued": queue_inspections(ids)}, HTTPStatus.ACCEPTED)
+            elif len(parts) == 5 and parts[:2] == ["api", "sources"] and parts[3] == "titles":
+                self._send_json(title_details(int(parts[2]), parts[4]))
+            elif parts == ["api", "batch"]:
+                try:
+                    job_ids = schedule_batch(self._json_body().get("items"))
+                except FileExistsError as error:
+                    self._send_json({"error": f"Destination exists: {error}. Choose another filename."}, HTTPStatus.CONFLICT)
+                else:
+                    self._send_json({"job_ids": job_ids}, HTTPStatus.CREATED)
             elif parts == ["api", "preferences"]:
                 self._save_preferences(self._json_body())
             elif (
@@ -524,7 +442,7 @@ class Handler(BaseHTTPRequestHandler):
         found = rows(
             SOURCE_SELECT
             + """
-             WHERE sources.present=1
+             WHERE sources.present=1 AND sources.kind='file'
                AND sources.queue_state IN ('awaiting', 'deferred')
                AND sources.series_name=?
                AND COALESCE(sources.season_number, 1)=?
@@ -764,9 +682,10 @@ class Handler(BaseHTTPRequestHandler):
         if not job:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
-        with transaction() as connection:
-            if action == "cancel" and job["status"] in {"queued", "running"}:
-                if job["status"] == "queued":
+        with transaction(immediate=True) as connection:
+            job = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if action == "cancel" and job["status"] in {"queued", "running", "awaiting_overwrite"}:
+                if job["status"] != "running":
                     connection.execute(
                         """
                         UPDATE jobs SET status='cancelled', phase='Cancelled',
@@ -784,6 +703,11 @@ class Handler(BaseHTTPRequestHandler):
                 "cancelled",
                 "retryable",
             }:
+                if connection.execute("""
+                    SELECT id FROM jobs WHERE id<>? AND status IN ('queued','running','awaiting_overwrite')
+                     AND (output_path=? OR (source_id=? AND title_id=?))
+                """, (job_id, job["output_path"], job["source_id"], job["title_id"])).fetchone():
+                    raise ValueError("Another job is already queued for this title or destination")
                 connection.execute(
                     """
                     UPDATE jobs
@@ -816,40 +740,29 @@ class Handler(BaseHTTPRequestHandler):
         preview_type = str(body.get("preview_type", "audio"))
         if preview_type not in {"audio", "subtitle"}:
             raise ValueError("Unsupported preview type")
-        existing = row(
-            """
-            SELECT * FROM previews
-             WHERE source_id=? AND title_id=? AND track_key=?
-               AND preview_type=?
-               AND status IN ('queued', 'running', 'complete')
-             ORDER BY id DESC LIMIT 1
-            """,
-            (source_id, title_id, track_key, preview_type),
-        )
-        if existing:
-            self._send_json({"id": existing["id"], "status": existing["status"]})
-            return
-        timestamp = now()
-        with transaction() as connection:
-            cursor = connection.execute(
-                """
-                INSERT INTO previews
-                    (source_id, title_id, track_key, preview_type,
-                     status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'queued', ?, ?)
-                """,
-                (
-                    source_id,
-                    title_id,
-                    track_key,
-                    preview_type,
-                    timestamp,
-                    timestamp,
-                ),
-            )
-        self._send_json(
-            {"id": cursor.lastrowid, "status": "queued"}, HTTPStatus.CREATED
-        )
+        with transaction(immediate=True) as connection:
+            source = connection.execute(
+                "SELECT mtime FROM sources WHERE id=? AND present=1 AND probe_status='ready'",
+                (source_id,),
+            ).fetchone()
+            if not source:
+                raise ValueError("Inspect the source before requesting a sample")
+            existing = connection.execute("""
+                SELECT id, status FROM previews WHERE source_id=? AND title_id=?
+                 AND track_key=? AND preview_type=? AND source_mtime=?
+                 AND status IN ('queued', 'running', 'complete') ORDER BY id DESC LIMIT 1
+            """, (source_id, title_id, track_key, preview_type, source["mtime"])).fetchone()
+            if existing:
+                result = dict(existing)
+            else:
+                stamp = now()
+                cursor = connection.execute("""
+                    INSERT INTO previews (source_id,title_id,track_key,preview_type,source_mtime,
+                                          status,created_at,updated_at)
+                    VALUES (?,?,?,?,?,'queued',?,?)
+                """, (source_id, title_id, track_key, preview_type, source["mtime"], stamp, stamp))
+                result = {"id": cursor.lastrowid, "status": "queued"}
+        self._send_json(result, HTTPStatus.OK if existing else HTTPStatus.CREATED)
 
     def _cleanup_action(self, cleanup_id: int, body: dict) -> None:
         item = row(
@@ -1054,6 +967,7 @@ class Handler(BaseHTTPRequestHandler):
                     ValueError,
                     KeyError,
                     json.JSONDecodeError,
+                    MediaError,
                     FileExistsError,
                     FileNotFoundError,
                     NotADirectoryError,

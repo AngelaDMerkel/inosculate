@@ -11,7 +11,7 @@ from app.config import settings
 from app.db import initialize, now, rows, transaction
 from app.seasons import episode_filename, season_analysis, season_plan
 from app.util import format_duration, parse_duration, safe_relative_mkv
-from app.worker import _selection_options
+from app.mux import _selection_options
 from app.web import _insert_prepared_job, _public_source
 
 
@@ -295,7 +295,7 @@ class SeasonTemplateTests(unittest.TestCase):
 
 
 class QueueStateTests(unittest.TestCase):
-    def test_a_source_can_only_be_scheduled_once(self) -> None:
+    def test_a_title_cannot_be_scheduled_twice_while_active(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             original_data = settings.data_dir
             object.__setattr__(settings, "data_dir", Path(directory) / "data")
@@ -324,7 +324,7 @@ class QueueStateTests(unittest.TestCase):
                 }
                 with transaction(immediate=True) as connection:
                     _insert_prepared_job(connection, prepared, timestamp)
-                with self.assertRaisesRegex(ValueError, "no longer awaiting"):
+                with self.assertRaisesRegex(ValueError, "already has a job"):
                     with transaction(immediate=True) as connection:
                         _insert_prepared_job(connection, prepared, timestamp)
                 queued = rows("SELECT * FROM jobs")

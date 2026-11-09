@@ -127,6 +127,7 @@ def initialize() -> None:
     connection = connect()
     try:
         connection.executescript(SCHEMA)
+        connection.execute("BEGIN IMMEDIATE")
         _ensure_column(connection, "sources", "group_key", "TEXT")
         _ensure_column(connection, "sources", "series_name", "TEXT")
         _ensure_column(connection, "sources", "season_number", "INTEGER")
@@ -162,10 +163,29 @@ def initialize() -> None:
             """
             UPDATE sources
                SET queue_state='scheduled'
-             WHERE queue_state='awaiting'
+             WHERE kind='file' AND queue_state='awaiting'
                AND EXISTS (SELECT 1 FROM jobs WHERE jobs.source_id=sources.id)
             """
         )
+        _ensure_column(connection, "jobs", "input_json", "TEXT")
+        _ensure_column(connection, "previews", "source_mtime", "REAL")
+        if connection.execute("PRAGMA user_version").fetchone()[0] < 1:
+            # MakeMKV title numbers are unrelated to DVD titles or MPLS numbers.
+            connection.execute("""
+                UPDATE jobs SET status='needs_selection',
+                     error='Choose the title again in the library after upgrading.'
+                 WHERE source_id IN (SELECT id FROM sources WHERE kind <> 'file')
+                   AND status NOT IN ('complete', 'cancelled')
+            """)
+            connection.execute("""
+                UPDATE sources SET metadata_json=NULL, probe_status='discovered',
+                       probe_error=NULL,
+                       queue_state=CASE WHEN queue_state='scheduled' THEN 'awaiting'
+                                        ELSE queue_state END
+                 WHERE kind IN ('dvd','bluray','iso')
+            """)
+            connection.execute("PRAGMA user_version=1")
+        connection.commit()
     finally:
         connection.close()
 
