@@ -1,78 +1,18 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Inosculate</title>
-  <link rel="stylesheet" href="/static/style.css">
-</head>
-<body>
-  <header>
-    <div>
-      <p class="eyebrow">LOCAL MEDIA REMUXER</p>
-      <h1>Inosculate</h1>
-    </div>
-    <div class="header-actions">
-      <span id="worker-summary" class="muted"></span>
-      <button id="scan-button" class="primary">Scan ingest</button>
-    </div>
-  </header>
-
-  <nav aria-label="Application sections">
-    <button class="tab active" data-view="library">Media <span id="source-count"></span></button>
-    <button class="tab" data-view="queue">Queue <span id="job-count"></span></button>
-    <button class="tab" data-view="cleanup">Cleanup <span id="cleanup-count"></span></button>
-  </nav>
-
-  <main>
-    <section id="library-view" class="view active">
-      <div class="section-heading">
-        <div>
-          <h2>Media inventory</h2>
-          <p id="ingest-path" class="path"></p>
-        </div>
-        <div class="library-tools">
-          <label class="search"><span>Search</span><input id="source-filter" type="search" placeholder="Title, series, or path"></label>
-          <button id="preferences-toggle">Preferences</button>
-        </div>
-      </div>
-
-      <form id="preferences-panel" class="preferences-panel hidden">
-        <label>Preferred audio
-          <select id="preferred-audio"></select>
-        </label>
-        <label>Preferred subtitles
-          <select id="preferred-subtitle"></select>
-        </label>
-        <label class="check-field">
-          <input id="forced-only" type="checkbox">
-          Forced subtitles only
-        </label>
-        <label>Ignored folders/patterns
-          <textarea id="ignored-patterns" rows="3" placeholder="One pattern per line"></textarea>
-        </label>
-        <button class="primary" type="submit">Save preferences</button>
-      </form>
-
-      <div id="source-list" class="group-list"></div>
-    </section>
-
-    <section id="queue-view" class="view">
-      <div class="section-heading">
-        <div><h2>Remux queue</h2><p>Only explicitly added items run here.</p></div>
-      </div>
-      <div id="job-list" class="card-list"></div>
-    </section>
-
-    <section id="cleanup-view" class="view">
-      <div class="section-heading">
-        <div><h2>Cleanup decisions</h2><p>Original media is never removed automatically.</p></div>
-      </div>
-      <div id="cleanup-list" class="card-list"></div>
-    </section>
-  </main>
-
-  <div id="toast" role="status" aria-live="polite"></div>
-  <script src="/static/app.js"></script>
-</body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#b45309" />
+    <meta
+      name="description"
+      content="Inspect and remux mixed media sources into carefully configured MKV files."
+    />
+    <title>Inosculate</title>
+    <script type="module" crossorigin src="/static/assets/index-DrcikxBb.js"></script>
+    <link rel="stylesheet" crossorigin href="/static/assets/index-CQeNzPuK.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
 </html>

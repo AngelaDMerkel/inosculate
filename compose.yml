@@ -1,6 +1,6 @@
 services:
   web:
-    image: docker.io/angeladmerkel/inosculate:${INOSCULATE_TAG:-0.1.1}
+    image: docker.io/angeladmerkel/inosculate:${INOSCULATE_TAG:-0.5.0}
     platform: linux/amd64
     pull_policy: always
     command: ["web"]
@@ -27,7 +27,7 @@ services:
       - "${APP_DATA_PATH:-./data}:/data:rw"
 
   worker:
-    image: docker.io/angeladmerkel/inosculate:${INOSCULATE_TAG:-0.1.1}
+    image: docker.io/angeladmerkel/inosculate:${INOSCULATE_TAG:-0.5.0}
     platform: linux/amd64
     pull_policy: always
     command: ["worker"]

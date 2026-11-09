@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS sources (
     size INTEGER NOT NULL DEFAULT 0,
     mtime REAL NOT NULL DEFAULT 0,
     present INTEGER NOT NULL DEFAULT 1,
-    probe_status TEXT NOT NULL DEFAULT 'pending',
+    probe_status TEXT NOT NULL DEFAULT 'discovered',
     probe_error TEXT,
     metadata_json TEXT,
     group_key TEXT,
@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS sources (
     season_number INTEGER,
     episode_number INTEGER,
     episode_title TEXT,
+    queue_state TEXT NOT NULL DEFAULT 'awaiting',
     discovered_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -54,6 +55,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 
 CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS jobs_source_idx ON jobs(source_id, id);
 
 CREATE TABLE IF NOT EXISTS previews (
     id INTEGER PRIMARY KEY,
@@ -132,6 +134,12 @@ def initialize() -> None:
         _ensure_column(connection, "sources", "episode_title", "TEXT")
         _ensure_column(
             connection,
+            "sources",
+            "queue_state",
+            "TEXT NOT NULL DEFAULT 'awaiting'",
+        )
+        _ensure_column(
+            connection,
             "jobs",
             "track_overrides_json",
             "TEXT NOT NULL DEFAULT '{}'",
@@ -148,6 +156,14 @@ def initialize() -> None:
             UPDATE sources
                SET probe_status='discovered'
              WHERE probe_status IN ('pending', 'waiting', 'probing')
+            """
+        )
+        connection.execute(
+            """
+            UPDATE sources
+               SET queue_state='scheduled'
+             WHERE queue_state='awaiting'
+               AND EXISTS (SELECT 1 FROM jobs WHERE jobs.source_id=sources.id)
             """
         )
     finally:

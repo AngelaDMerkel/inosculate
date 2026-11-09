@@ -16,6 +16,7 @@ from .catalog import LANGUAGES, preferences
 from .config import settings
 from .db import now, row, rows, transaction
 from .scanner import discover
+from .seasons import season_analysis, season_plan
 from .util import (
     ensure_beneath,
     format_duration,
@@ -29,11 +30,33 @@ from .util import (
 STATIC_DIR = Path(__file__).parent / "static"
 
 
-def _public_source(value: dict) -> dict:
+def _public_source(value: dict, *, include_metadata: bool = True) -> dict:
     result = dict(value)
     metadata = json_load(result.pop("metadata_json", None), {})
-    result["metadata"] = metadata
     result["size_display"] = human_bytes(result.get("size"))
+    titles = metadata.get("titles", [])
+    primary = next(
+        (title for title in titles if title.get("suggested")),
+        titles[0] if titles else None,
+    )
+    tracks = primary.get("tracks", []) if primary else []
+    result["media_summary"] = {
+        "title_count": len(titles),
+        "duration": primary.get("duration") if primary else None,
+        "duration_display": (
+            format_duration(primary.get("duration")) if primary else None
+        ),
+        "resolution": primary.get("resolution") if primary else None,
+        "resolution_class": primary.get("resolution_class") if primary else None,
+        "video_tracks": sum(track.get("type") == "video" for track in tracks),
+        "audio_tracks": sum(track.get("type") == "audio" for track in tracks),
+        "subtitle_tracks": sum(
+            track.get("type") == "subtitle" for track in tracks
+        ),
+    }
+    if not include_metadata:
+        return result
+    result["metadata"] = metadata
     for title in metadata.get("titles", []):
         title["duration_display"] = format_duration(title.get("duration"))
         title["size_display"] = human_bytes(title.get("size"))
@@ -47,7 +70,138 @@ def _public_source(value: dict) -> dict:
 def _public_job(value: dict) -> dict:
     result = dict(value)
     result["selected_tracks"] = json_load(result.pop("selected_tracks_json"), [])
+    result["track_overrides"] = json_load(
+        result.pop("track_overrides_json", None), {}
+    )
     return result
+
+
+SOURCE_SELECT = """
+SELECT sources.*,
+       (SELECT status FROM jobs
+         WHERE jobs.source_id=sources.id
+         ORDER BY jobs.id DESC LIMIT 1) AS latest_job_status,
+       (SELECT COUNT(*) FROM jobs
+         WHERE jobs.source_id=sources.id
+           AND jobs.status IN ('queued','running','awaiting_overwrite'))
+           AS active_job_count,
+       (SELECT COUNT(*) FROM jobs
+         WHERE jobs.source_id=sources.id AND jobs.status='complete')
+           AS completed_job_count
+  FROM sources
+"""
+
+
+def _prepared_job(source: dict, body: dict) -> dict:
+    if not source or source["probe_status"] != "ready":
+        raise ValueError("This source is not ready")
+    output_kind = body.get("output_kind")
+    if output_kind not in {"movie", "television"}:
+        raise ValueError("Choose Movies or Television")
+    relative = safe_relative_mkv(str(body.get("relative_path", "")))
+    root = (
+        settings.movies_dir if output_kind == "movie" else settings.television_dir
+    )
+    output = ensure_beneath(root / relative, root)
+    overwrite = bool(body.get("overwrite"))
+    if output.exists() and not overwrite:
+        raise FileExistsError(str(output))
+
+    metadata = json_load(source["metadata_json"], {})
+    title_id = str(body.get("title_id", "0"))
+    title = next(
+        (
+            value
+            for value in metadata.get("titles", [])
+            if str(value["id"]) == title_id
+        ),
+        None,
+    )
+    if not title:
+        raise ValueError("Selected title was not found")
+    available = {str(track["key"]) for track in title.get("tracks", [])}
+    selected = list(
+        dict.fromkeys(
+            str(value)
+            for value in body.get("selected_tracks", [])
+            if str(value) in available
+        )
+    )
+    if not selected:
+        raise ValueError("Select at least one track")
+    selected_types = {
+        track["type"]
+        for track in title.get("tracks", [])
+        if str(track["key"]) in selected
+    }
+    if not selected_types.intersection({"video", "audio"}):
+        raise ValueError("Select at least one video or audio track")
+
+    raw_overrides = body.get("track_overrides", {})
+    if not isinstance(raw_overrides, dict):
+        raise ValueError("Track overrides must be an object")
+    language_codes = {code for code, _ in LANGUAGES}
+    overrides: dict[str, dict[str, str]] = {}
+    for track_key, value in raw_overrides.items():
+        if str(track_key) not in available or not isinstance(value, dict):
+            continue
+        language = str(value.get("language", "")).strip().lower()
+        name = safe_component(str(value.get("name", "")).strip(), "")
+        if language and language not in language_codes:
+            raise ValueError(f"Unsupported track language: {language}")
+        if language or name:
+            overrides[str(track_key)] = {
+                "language": language,
+                "name": name,
+            }
+    return {
+        "source_id": int(source["id"]),
+        "title_id": title_id,
+        "output_kind": output_kind,
+        "relative_path": str(relative),
+        "output_path": str(output),
+        "selected_tracks": selected,
+        "track_overrides": overrides,
+        "overwrite": overwrite,
+    }
+
+
+def _insert_prepared_job(
+    connection: object, prepared: dict, timestamp: str
+) -> int:
+    claimed = connection.execute(
+        """
+        UPDATE sources
+           SET queue_state='scheduled', updated_at=?
+         WHERE id=? AND present=1
+           AND queue_state IN ('awaiting', 'deferred')
+        """,
+        (timestamp, prepared["source_id"]),
+    )
+    if claimed.rowcount != 1:
+        raise ValueError("This source is no longer awaiting a queue decision")
+    cursor = connection.execute(
+        """
+        INSERT INTO jobs
+            (source_id, title_id, output_kind, relative_path, output_path,
+             selected_tracks_json, track_overrides_json,
+             status, overwrite_approved, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+        """,
+        (
+            prepared["source_id"],
+            prepared["title_id"],
+            prepared["output_kind"],
+            prepared["relative_path"],
+            prepared["output_path"],
+            json.dumps(prepared["selected_tracks"]),
+            json.dumps(prepared["track_overrides"]),
+            prepared["overwrite"],
+            timestamp,
+            timestamp,
+        ),
+    )
+    return int(cursor.lastrowid)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -74,7 +228,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def _send_file(self, path: Path, content_type: str | None = None) -> None:
+    def _send_file(
+        self,
+        path: Path,
+        content_type: str | None = None,
+        cache_control: str = "private, max-age=3600",
+    ) -> None:
         if not path.exists() or not path.is_file():
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -110,7 +269,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         if partial:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-        self.send_header("Cache-Control", "private, max-age=3600")
+        self.send_header("Cache-Control", cache_control)
         self.end_headers()
         with path.open("rb") as handle:
             handle.seek(start)
@@ -132,9 +291,16 @@ class Handler(BaseHTTPRequestHandler):
         try:
             parts = self._route_parts()
             if not parts:
-                self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
-            elif parts[0] == "static" and len(parts) == 2:
-                self._send_file(STATIC_DIR / safe_component(parts[1]))
+                self._send_file(
+                    STATIC_DIR / "index.html",
+                    "text/html; charset=utf-8",
+                    "no-store",
+                )
+            elif parts[0] == "static" and len(parts) >= 2:
+                self._send_file(
+                    ensure_beneath(STATIC_DIR.joinpath(*parts[1:]), STATIC_DIR),
+                    cache_control="no-cache, max-age=0",
+                )
             elif parts == ["api", "health"]:
                 self._send_json({"ok": True, "version": __version__})
             elif parts == ["api", "settings"]:
@@ -161,28 +327,15 @@ class Handler(BaseHTTPRequestHandler):
                 query = self._query()
                 kind = query.get("kind", [""])[0]
                 self._send_json(self._directories(kind))
+            elif parts == ["api", "seasons"]:
+                self._send_json(self._season_summaries())
             elif parts == ["api", "sources"]:
                 self._send_json(
                     [
-                        _public_source(value)
+                        _public_source(value, include_metadata=False)
                         for value in rows(
-                            """
-                            SELECT sources.*,
-                                   (SELECT status FROM jobs
-                                     WHERE jobs.source_id=sources.id
-                                     ORDER BY jobs.id DESC LIMIT 1)
-                                       AS latest_job_status,
-                                   (SELECT COUNT(*) FROM jobs
-                                     WHERE jobs.source_id=sources.id
-                                       AND jobs.status IN
-                                           ('queued','running',
-                                            'awaiting_overwrite'))
-                                       AS active_job_count,
-                                   (SELECT COUNT(*) FROM jobs
-                                     WHERE jobs.source_id=sources.id
-                                       AND jobs.status='complete')
-                                       AS completed_job_count
-                              FROM sources
+                            SOURCE_SELECT
+                            + """
                              WHERE present=1
                              ORDER BY COALESCE(series_name, name) COLLATE NOCASE,
                                       season_number, episode_number,
@@ -192,7 +345,10 @@ class Handler(BaseHTTPRequestHandler):
                     ]
                 )
             elif len(parts) == 3 and parts[:2] == ["api", "sources"]:
-                source = row("SELECT * FROM sources WHERE id=?", (int(parts[2]),))
+                source = row(
+                    SOURCE_SELECT + " WHERE sources.id=?",
+                    (int(parts[2]),),
+                )
                 if not source:
                     self.send_error(HTTPStatus.NOT_FOUND)
                 else:
@@ -203,13 +359,36 @@ class Handler(BaseHTTPRequestHandler):
                         _public_job(value)
                         for value in rows(
                             """
-                            SELECT jobs.*, sources.name AS source_name
+                            SELECT jobs.id, jobs.source_id, jobs.title_id,
+                                   jobs.output_kind, jobs.relative_path,
+                                   jobs.output_path, jobs.selected_tracks_json,
+                                   jobs.track_overrides_json, jobs.status,
+                                   jobs.progress, jobs.phase,
+                                   jobs.cancel_requested,
+                                   jobs.overwrite_approved, jobs.attempts,
+                                   jobs.error, jobs.created_at,
+                                   jobs.started_at, jobs.finished_at,
+                                   jobs.updated_at,
+                                   sources.name AS source_name
                               FROM jobs JOIN sources ON sources.id=jobs.source_id
                              ORDER BY jobs.created_at DESC LIMIT 200
                             """
                         )
                     ]
                 )
+            elif (
+                len(parts) == 4
+                and parts[:2] == ["api", "jobs"]
+                and parts[3] == "log"
+            ):
+                job = row(
+                    "SELECT id, log FROM jobs WHERE id=?",
+                    (int(parts[2]),),
+                )
+                if not job:
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                else:
+                    self._send_json({"id": job["id"], "log": job["log"] or ""})
             elif parts == ["api", "cleanup"]:
                 self._send_json(
                     rows(
@@ -234,7 +413,14 @@ class Handler(BaseHTTPRequestHandler):
                     value = dict(preview)
                     result = json_load(value.pop("result_json", None), {})
                     value["result"] = result
-                    if value["status"] == "complete" and result.get("kind") == "audio":
+                    if (
+                        value["status"] == "complete"
+                        and value.get("path")
+                        and (
+                            result.get("kind") == "audio"
+                            or value.get("preview_type") == "audio"
+                        )
+                    ):
                         value["audio_url"] = f"/api/previews/{value['id']}/audio"
                     elif (
                         value["status"] == "complete"
@@ -293,16 +479,30 @@ class Handler(BaseHTTPRequestHandler):
                 and parts[3] in {"refresh", "inspect"}
             ):
                 with transaction() as connection:
-                    connection.execute(
+                    cursor = connection.execute(
                         """
                         UPDATE sources
                            SET probe_status='inspection_queued',
                                probe_error=NULL, updated_at=?
-                         WHERE id=?
+                         WHERE id=? AND present=1
                         """,
                         (now(), int(parts[2])),
                     )
+                    if cursor.rowcount != 1:
+                        raise ValueError("Source was not found in the current inventory")
                 self._send_json({"ok": True}, HTTPStatus.ACCEPTED)
+            elif (
+                len(parts) == 4
+                and parts[:2] == ["api", "sources"]
+                and parts[3] == "disposition"
+            ):
+                self._source_disposition(int(parts[2]), self._json_body())
+            elif parts == ["api", "seasons", "analyze"]:
+                self._analyze_season(self._json_body())
+            elif parts == ["api", "seasons", "preflight"]:
+                self._season_preflight(self._json_body())
+            elif parts == ["api", "seasons", "schedule"]:
+                self._schedule_season(self._json_body())
             elif parts == ["api", "jobs"]:
                 self._create_job(self._json_body())
             elif len(parts) == 4 and parts[:2] == ["api", "jobs"]:
@@ -316,100 +516,247 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as error:
             self._handle_error(error)
 
-    def _create_job(self, body: dict) -> None:
-        source = row("SELECT * FROM sources WHERE id=?", (int(body["source_id"]),))
-        if not source or source["probe_status"] != "ready":
-            raise ValueError("This source is not ready")
+    def _season_sources(self, body: dict) -> list[dict]:
+        series_name = str(body.get("series_name", "")).strip()
+        if not series_name:
+            raise ValueError("A series is required")
+        season_number = int(body.get("season_number", 1))
+        found = rows(
+            SOURCE_SELECT
+            + """
+             WHERE sources.present=1
+               AND sources.queue_state IN ('awaiting', 'deferred')
+               AND sources.series_name=?
+               AND COALESCE(sources.season_number, 1)=?
+             ORDER BY sources.episode_number, sources.name COLLATE NOCASE
+            """,
+            (series_name, season_number),
+        )
+        if not found:
+            raise ValueError("No awaiting sources were found for this season")
+        return found
+
+    def _season_summaries(self) -> list[dict]:
+        found = rows(
+            """
+            SELECT * FROM sources
+             WHERE present=1
+               AND queue_state IN ('awaiting', 'deferred')
+               AND series_name IS NOT NULL
+             ORDER BY series_name COLLATE NOCASE, season_number, episode_number
+            """
+        )
+        grouped: dict[tuple[str, int], list[dict]] = {}
+        for source in found:
+            key = (
+                str(source["series_name"]),
+                int(source.get("season_number") or 1),
+            )
+            grouped.setdefault(key, []).append(source)
+        return [
+            {
+                "series_name": series_name,
+                "season_number": season_number,
+                **season_analysis(season_sources),
+            }
+            for (series_name, season_number), season_sources in grouped.items()
+        ]
+
+    def _analyze_season(self, body: dict) -> None:
+        sources = self._season_sources(body)
+        source_ids = [
+            int(source["id"])
+            for source in sources
+            if source["probe_status"] in {"discovered", "error"}
+        ]
+        if source_ids:
+            placeholders = ",".join("?" for _ in source_ids)
+            with transaction() as connection:
+                connection.execute(
+                    f"""
+                    UPDATE sources
+                       SET probe_status='inspection_queued', probe_error=NULL,
+                           updated_at=?
+                     WHERE id IN ({placeholders})
+                    """,
+                    (now(), *source_ids),
+                )
+        self._send_json(
+            {
+                "ok": True,
+                "queued": len(source_ids),
+                "total": len(sources),
+            },
+            HTTPStatus.ACCEPTED,
+        )
+
+    def _season_plan(self, body: dict) -> tuple[list[dict], dict]:
+        sources = self._season_sources(body)
+        template_id = int(body.get("template_source_id", 0))
+        template = next(
+            (source for source in sources if int(source["id"]) == template_id),
+            None,
+        )
+        if not template:
+            raise ValueError("Choose a template episode from this season")
+        plan = season_plan(template, sources, body)
         output_kind = body.get("output_kind")
         if output_kind not in {"movie", "television"}:
             raise ValueError("Choose Movies or Television")
-        relative = safe_relative_mkv(str(body.get("relative_path", "")))
-        root = (
-            settings.movies_dir if output_kind == "movie" else settings.television_dir
+        output_root = (
+            settings.movies_dir
+            if output_kind == "movie"
+            else settings.television_dir
         )
-        output = ensure_beneath(root / relative, root)
         overwrite = bool(body.get("overwrite"))
-        if output.exists() and not overwrite:
+        for item in plan["items"]:
+            if not item["matched"]:
+                continue
+            output = ensure_beneath(
+                output_root / Path(item["relative_path"]), output_root
+            )
+            item["output_path"] = str(output)
+            if output.exists() and not overwrite:
+                item["matched"] = False
+                item["reason"] = "Destination already exists"
+        plan["matched"] = sum(bool(item["matched"]) for item in plan["items"])
+        plan["exceptions"] = plan["total"] - plan["matched"]
+        return sources, plan
+
+    def _season_preflight(self, body: dict) -> None:
+        _, plan = self._season_plan(body)
+        self._send_json(plan)
+
+    def _schedule_season(self, body: dict) -> None:
+        if body.get("confirm") is not True:
+            raise ValueError("Season scheduling requires explicit confirmation")
+        sources, plan = self._season_plan(body)
+        requested = {
+            int(value) for value in body.get("source_ids", [])
+        } or {
+            int(item["source_id"]) for item in plan["items"] if item["matched"]
+        }
+        source_map = {int(source["id"]): source for source in sources}
+        prepared_jobs: list[dict] = []
+        for item in plan["items"]:
+            source_id = int(item["source_id"])
+            if source_id not in requested or not item["matched"]:
+                continue
+            prepared_jobs.append(
+                _prepared_job(
+                    source_map[source_id],
+                    {
+                        "title_id": item["title_id"],
+                        "output_kind": body["output_kind"],
+                        "relative_path": item["relative_path"],
+                        "selected_tracks": item["selected_tracks"],
+                        "track_overrides": item["track_overrides"],
+                        "overwrite": bool(body.get("overwrite")),
+                    },
+                )
+            )
+        if not prepared_jobs:
+            raise ValueError("No matching season episodes were selected")
+        timestamp = now()
+        with transaction(immediate=True) as connection:
+            job_ids = [
+                _insert_prepared_job(connection, prepared, timestamp)
+                for prepared in prepared_jobs
+            ]
+        self._send_json(
+            {
+                "ok": True,
+                "scheduled": len(job_ids),
+                "job_ids": job_ids,
+                "exceptions": plan["exceptions"],
+            },
+            HTTPStatus.CREATED,
+        )
+
+    def _source_disposition(self, source_id: int, body: dict) -> None:
+        source = row("SELECT * FROM sources WHERE id=?", (source_id,))
+        if not source or not source["present"]:
+            raise ValueError("Source was not found in the current inventory")
+        action = str(body.get("action", ""))
+        if source["queue_state"] not in {"awaiting", "deferred"}:
+            raise ValueError(
+                "Only sources awaiting a queue decision can be changed here"
+            )
+        if action in {"defer", "resume"}:
+            state = "deferred" if action == "defer" else "awaiting"
+            with transaction() as connection:
+                connection.execute(
+                    "UPDATE sources SET queue_state=?, updated_at=? WHERE id=?",
+                    (state, now(), source_id),
+                )
+            self._send_json({"ok": True, "queue_state": state})
+            return
+        if action not in {"trash", "delete"} or body.get("confirm") is not True:
+            raise ValueError("Source removal requires explicit confirmation")
+        if row(
+            """
+            SELECT id FROM jobs
+             WHERE source_id=?
+               AND status NOT IN ('complete', 'failed', 'cancelled')
+             LIMIT 1
+            """,
+            (source_id,),
+        ):
+            raise ValueError("This source still has an active remux job")
+
+        source_path = ensure_beneath(Path(source["path"]), settings.ingest_dir)
+        if action == "trash":
+            if not settings.trash_dir:
+                raise ValueError("The ingest trash directory is not configured")
+            settings.trash_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            destination = settings.trash_dir / f"{source_path.name}.{stamp}"
+            counter = 1
+            while destination.exists():
+                destination = (
+                    settings.trash_dir
+                    / f"{source_path.name}.{counter}.{stamp}"
+                )
+                counter += 1
+            if source_path.exists():
+                shutil.move(str(source_path), str(destination))
+            decision = "trashed"
+        else:
+            if source_path.is_dir():
+                shutil.rmtree(source_path)
+            else:
+                source_path.unlink(missing_ok=True)
+            decision = "deleted"
+        with transaction() as connection:
+            connection.execute(
+                """
+                UPDATE sources
+                   SET present=0, queue_state='removed', updated_at=?
+                 WHERE id=?
+                """,
+                (now(), source_id),
+            )
+        self._send_json({"ok": True, "decision": decision})
+
+    def _create_job(self, body: dict) -> None:
+        source = row("SELECT * FROM sources WHERE id=?", (int(body["source_id"]),))
+        if not source:
+            raise ValueError("This source was not found")
+        try:
+            prepared = _prepared_job(source, body)
+        except FileExistsError as error:
             self._send_json(
                 {
                     "error": "Destination already exists",
                     "code": "destination_exists",
-                    "output_path": str(output),
+                    "output_path": str(error),
                 },
                 HTTPStatus.CONFLICT,
             )
             return
-        metadata = json_load(source["metadata_json"], {})
-        title_id = str(body.get("title_id", "0"))
-        title = next(
-            (
-                value
-                for value in metadata.get("titles", [])
-                if str(value["id"]) == title_id
-            ),
-            None,
-        )
-        if not title:
-            raise ValueError("Selected title was not found")
-        available = {str(track["key"]) for track in title.get("tracks", [])}
-        selected = list(
-            dict.fromkeys(
-                str(value)
-                for value in body.get("selected_tracks", [])
-                if str(value) in available
-            )
-        )
-        if not selected:
-            raise ValueError("Select at least one track")
-        selected_types = {
-            track["type"]
-            for track in title.get("tracks", [])
-            if str(track["key"]) in selected
-        }
-        if not selected_types.intersection({"video", "audio"}):
-            raise ValueError("Select at least one video or audio track")
-        raw_overrides = body.get("track_overrides", {})
-        if not isinstance(raw_overrides, dict):
-            raise ValueError("Track overrides must be an object")
-        language_codes = {code for code, _ in LANGUAGES}
-        overrides: dict[str, dict[str, str]] = {}
-        for track_key, value in raw_overrides.items():
-            if str(track_key) not in available or not isinstance(value, dict):
-                continue
-            language = str(value.get("language", "")).strip().lower()
-            name = safe_component(str(value.get("name", "")).strip(), "")
-            if language and language not in language_codes:
-                raise ValueError(f"Unsupported track language: {language}")
-            if language or name:
-                overrides[str(track_key)] = {
-                    "language": language,
-                    "name": name,
-                }
         timestamp = now()
         with transaction() as connection:
-            cursor = connection.execute(
-                """
-                INSERT INTO jobs
-                    (source_id, title_id, output_kind, relative_path, output_path,
-                     selected_tracks_json, track_overrides_json,
-                     status, overwrite_approved,
-                     created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
-                """,
-                (
-                    source["id"],
-                    title_id,
-                    output_kind,
-                    str(relative),
-                    str(output),
-                    json.dumps(selected),
-                    json.dumps(overrides),
-                    overwrite,
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            job_id = cursor.lastrowid
+            job_id = _insert_prepared_job(connection, prepared, timestamp)
         self._send_json({"id": job_id, "status": "queued"}, HTTPStatus.CREATED)
 
     def _job_action(self, job_id: int, action: str) -> None:
@@ -539,7 +886,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
             self._send_json({"ok": True})
             return
-        if decision != "delete" or body.get("confirm") is not True:
+        if decision not in {"trash", "delete"} or body.get("confirm") is not True:
             raise ValueError("Deletion requires explicit confirmation")
 
         source_path = ensure_beneath(Path(item["path"]), settings.ingest_dir)
@@ -556,7 +903,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError(
                     "This source still has an active or retryable remux job"
                 )
-            if settings.trash_dir:
+            if decision == "trash":
+                if not settings.trash_dir:
+                    raise ValueError("The ingest trash directory is not configured")
                 settings.trash_dir.mkdir(parents=True, exist_ok=True)
                 destination = settings.trash_dir / (
                     f"{source_path.name}.{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
@@ -585,7 +934,11 @@ class Handler(BaseHTTPRequestHandler):
                     (final_decision, now(), cleanup_id),
                 )
                 connection.execute(
-                    "UPDATE sources SET present=0, updated_at=? WHERE id=?",
+                    """
+                    UPDATE sources
+                       SET present=0, queue_state='removed', updated_at=?
+                     WHERE id=?
+                    """,
                     (now(), item["source_id"]),
                 )
                 connection.execute(
@@ -697,7 +1050,15 @@ class Handler(BaseHTTPRequestHandler):
             HTTPStatus.BAD_REQUEST
             if isinstance(
                 error,
-                (ValueError, KeyError, json.JSONDecodeError, FileNotFoundError),
+                (
+                    ValueError,
+                    KeyError,
+                    json.JSONDecodeError,
+                    FileExistsError,
+                    FileNotFoundError,
+                    NotADirectoryError,
+                    PermissionError,
+                ),
             )
             else HTTPStatus.INTERNAL_SERVER_ERROR
         )

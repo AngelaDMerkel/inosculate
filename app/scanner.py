@@ -98,27 +98,40 @@ def discover() -> dict[str, object]:
             if kind:
                 found.append((path, kind, infer_episode(path, root)))
 
+    # Resolve paths and read stat metadata before opening the database write
+    # transaction. Network-mounted filesystems can make these calls slow, and
+    # they must not pause worker progress updates.
+    inventory: list[
+        tuple[str, str, str, int, float, dict[str, object]]
+    ] = []
+    for path, kind, grouping in found:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        inventory.append(
+            (
+                str(path.resolve()),
+                path.stem if path.is_file() else path.parent.name,
+                kind,
+                stat.st_size if path.is_file() else 0,
+                stat.st_mtime,
+                grouping,
+            )
+        )
+
     timestamp = now()
-    discovered_paths = {str(path.resolve()) for path, _, _ in found}
+    discovered_paths = {value[0] for value in inventory}
     new_count = 0
     updated_count = 0
     with transaction(immediate=True) as connection:
         connection.execute("UPDATE sources SET present=0, updated_at=?", (timestamp,))
-        for path, kind, grouping in found:
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            # Do not recursively calculate directory sizes. That can open every
-            # VOB/M2TS and make a network-mounted source look busy or locked.
-            size = stat.st_size if path.is_file() else 0
-            mtime = stat.st_mtime
-            resolved = str(path.resolve())
+        for resolved, name, kind, size, mtime, grouping in inventory:
             existing = connection.execute(
                 "SELECT id, size, mtime FROM sources WHERE path=?", (resolved,)
             ).fetchone()
             values = (
-                path.stem if path.is_file() else path.parent.name,
+                name,
                 kind,
                 size,
                 mtime,

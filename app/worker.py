@@ -25,6 +25,10 @@ from .process import run_process
 from .util import ensure_beneath, json_load
 
 
+_JOB_UPDATE_LOCK = threading.Lock()
+_JOB_UPDATE_STATE: dict[int, dict[str, Any]] = {}
+
+
 def _claim_source() -> dict[str, Any] | None:
     with transaction(immediate=True) as connection:
         candidate = connection.execute(
@@ -232,10 +236,14 @@ def _create_subtitle_preview(
         "-hide_banner",
         "-loglevel",
         "error",
+        "-ss",
+        str(max(0, start)),
         "-i",
         str(source_path),
         "-map",
         f"0:s:{int(track.get('ordinal', 0))}",
+        "-t",
+        "180",
         "-c:s",
         "srt",
         "-y",
@@ -319,9 +327,40 @@ def _job_update(
     progress: float | None = None,
     phase: str | None = None,
     line: str | None = None,
+    force: bool = False,
 ) -> None:
-    with transaction() as connection:
+    monotonic = time.monotonic()
+    with _JOB_UPDATE_LOCK:
+        state = _JOB_UPDATE_STATE.setdefault(
+            job_id,
+            {"lines": [], "last_flush": 0.0, "last_progress": None},
+        )
         if line:
+            state["lines"].append(line)
+        progress_bucket = int(progress) if progress is not None else None
+        should_flush = (
+            force
+            or phase is not None
+            or not line
+            or len(state["lines"]) >= 20
+            or monotonic - float(state["last_flush"]) >= 2.0
+            or (
+                progress_bucket is not None
+                and progress_bucket != state["last_progress"]
+                and monotonic - float(state["last_flush"]) >= 0.4
+            )
+        )
+        if not should_flush:
+            return
+        lines = state["lines"]
+        state["lines"] = []
+        state["last_flush"] = monotonic
+        if progress_bucket is not None:
+            state["last_progress"] = progress_bucket
+
+    log_chunk = "\n".join(lines)
+    with transaction() as connection:
+        if log_chunk:
             connection.execute(
                 """
                 UPDATE jobs
@@ -330,7 +369,7 @@ def _job_update(
                        phase=COALESCE(?, phase), updated_at=?
                  WHERE id=?
                 """,
-                (line, progress, phase, now(), job_id),
+                (log_chunk, progress, phase, now(), job_id),
             )
         else:
             connection.execute(
@@ -342,6 +381,10 @@ def _job_update(
                 """,
                 (progress, phase, now(), job_id),
             )
+
+
+def _flush_job_update(job_id: int) -> None:
+    _job_update(job_id, force=True)
 
 
 def _selected_by_type(
@@ -491,6 +534,7 @@ def _run_job(job: dict[str, Any]) -> None:
                 str(work),
             ]
             code = run_process(command, report, cancelled)
+            _flush_job_update(job["id"])
             if cancelled():
                 raise InterruptedError("Cancelled")
             if code != 0:
@@ -511,6 +555,7 @@ def _run_job(job: dict[str, Any]) -> None:
             str(mux_input),
         ]
         code = run_process(command, report, cancelled)
+        _flush_job_update(job["id"])
         if cancelled():
             raise InterruptedError("Cancelled")
         if code not in {0, 1}:

@@ -1,0 +1,8 @@
+.git
+.gitignore
+.pnpm-store
+**/__pycache__
+**/*.pyc
+data
+frontend/node_modules
+frontend/*.tsbuildinfo

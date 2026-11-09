@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
 from typing import Any
@@ -78,32 +77,3 @@ def ensure_beneath(path: Path, root: Path) -> Path:
     resolved = path.resolve()
     resolved.relative_to(root.resolve())
     return resolved
-
-
-def directory_size(path: Path) -> int:
-    total = 0
-    for root, _, files in os.walk(path):
-        for filename in files:
-            try:
-                total += (Path(root) / filename).stat().st_size
-            except OSError:
-                continue
-    return total
-
-
-def source_signature(path: Path) -> tuple[int, float]:
-    if path.is_file():
-        stat = path.stat()
-        return stat.st_size, stat.st_mtime
-    size = 0
-    newest = path.stat().st_mtime
-    for root, _, files in os.walk(path):
-        for filename in files:
-            try:
-                stat = (Path(root) / filename).stat()
-            except OSError:
-                continue
-            size += stat.st_size
-            newest = max(newest, stat.st_mtime)
-    return size, newest
-
