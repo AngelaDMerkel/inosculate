@@ -1,20 +1,21 @@
 import { useState } from "react";
-import Preview from "./Preview";
-import { api, Draft, draftKey, Track } from "./model";
+import TrackEditor from "./TrackEditor";
+import { api, Draft, draftKey, jobRequest, sameLanguage, Settings } from "./model";
 
 interface Props {
+  settings: Settings;
   drafts: Draft[];
   change: (items: Draft[]) => void;
   finish: () => void;
 }
 
-export default function Batch({ drafts, change, finish }: Props) {
+export default function Batch({ drafts, change, finish, settings }: Props) {
   const [audio, setAudio] = useState("*");
   const [subs, setSubs] = useState("*");
   const [note, setNote] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [sample, setSample] = useState<{ draft: Draft; track: Track } | null>(null);
+
   const languages = (type: string) =>
     Array.from(
       new Set(
@@ -32,15 +33,16 @@ export default function Batch({ drafts, change, finish }: Props) {
         const missing =
           audio !== "*" &&
           audioTracks.length > 0 &&
-          !audioTracks.some((t) => (t.language || "und") === audio);
+          !audioTracks.some((t) => sameLanguage(t.language || "und", audio));
         if (missing) skipped.push(d.source.name);
         const keys = tracks
           .filter((t) => {
             if (t.type === "audio")
               return missing
                 ? d.keys.includes(t.key)
-                : audio === "*" || (t.language || "und") === audio;
-            if (t.type === "subtitle") return subs === "*" || (t.language || "und") === subs;
+                : audio === "*" || sameLanguage(t.language || "und", audio);
+            if (t.type === "subtitle")
+              return subs === "*" || sameLanguage(t.language || "und", subs);
             return d.keys.includes(t.key);
           })
           .map((t) => t.key);
@@ -61,14 +63,7 @@ export default function Batch({ drafts, change, finish }: Props) {
     setError("");
     try {
       await api("batch", {
-        items: drafts.map((d) => ({
-          source_id: d.source.id,
-          mtime: d.source.mtime,
-          title_id: d.title.id,
-          output_kind: d.library,
-          relative_path: d.filename,
-          selected_tracks: d.keys,
-        })),
+        items: drafts.map(jobRequest),
       });
       finish();
     } catch (err) {
@@ -164,49 +159,13 @@ export default function Batch({ drafts, change, finish }: Props) {
                     Tracks · {d.keys.length} of{" "}
                     {(d.title.tracks || []).filter((t) => t.type !== "other").length} selected
                   </summary>
-                  {(d.title.tracks || [])
-                    .filter((t) => t.type !== "other")
-                    .map((t) => (
-                      <div className="track" key={t.key}>
-                        <input
-                          type="checkbox"
-                          aria-label={
-                            "Keep " + t.type + " track " + t.key + " " + (t.name || t.codec)
-                          }
-                          checked={d.keys.includes(t.key)}
-                          onChange={(e) =>
-                            edit(i, {
-                              keys: e.target.checked
-                                ? [...d.keys, t.key]
-                                : d.keys.filter((k) => k !== t.key),
-                            })
-                          }
-                        />
-                        <span className="type">{t.type}</span>
-                        <strong>{t.name || t.codec}</strong>
-                        <span>
-                          {[t.language || "und", t.forced ? "forced" : ""]
-                            .filter(Boolean)
-                            .join(" · ")}
-                        </span>
-                        {t.type !== "video" && (
-                          <button
-                            className="quiet"
-                            onClick={() => setSample({ draft: d, track: t })}
-                            aria-label={"Preview " + t.type + " track " + t.key}
-                          >
-                            Sample
-                          </button>
-                        )}
-                      </div>
-                    ))}
+                  <TrackEditor draft={d} settings={settings} change={(patch) => edit(i, patch)} />
                 </details>
               </article>
             ))}
           </div>
         </fieldset>
       )}
-      {sample && <Preview {...sample} close={() => setSample(null)} />}
     </section>
   );
 }

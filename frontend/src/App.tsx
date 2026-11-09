@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Batch from "./Batch";
 import Jobs from "./Jobs";
 import Library from "./Library";
-import { api, Draft, draftKey, Job, Source } from "./model";
+import { Cleanup, Processed, SettingsPage } from "./Management";
+import { api, Draft, draftKey, Job, Source, Settings, Preferences } from "./model";
 
-const tabs = ["Library", "Batch", "Jobs"] as const;
+const tabs = ["Library", "Batch", "Jobs", "Processed", "Settings"] as const;
 type Tab = (typeof tabs)[number];
 const draftStorage = "inosculate.batch.v1";
 function savedBatch(): Draft[] {
@@ -19,9 +20,42 @@ function savedBatch(): Draft[] {
 }
 export default function App() {
   const [tab, setTab] = useState<Tab>("Library");
+  const [settings, setSettings] = useState<Settings | null>(null);
+  const [prefs, setPrefs] = useState<Preferences | null>(null);
+  const [configError, setConfigError] = useState("");
+  const [configAttempt, retryConfig] = useState(0);
+  const remembered = useRef(new Map<string, Draft>());
+  useEffect(() => {
+    let live = true;
+    Promise.all([api<Settings>("settings"), api<Preferences>("preferences")])
+      .then(([config, preferences]) => {
+        if (live) {
+          setSettings(config);
+          setPrefs(preferences);
+          setConfigError("");
+        }
+      })
+      .catch((e) => {
+        if (live) setConfigError(e.message);
+      });
+    return () => {
+      live = false;
+    };
+  }, [configAttempt]);
+  const [cleanup, setCleanup] = useState<Cleanup[]>([]);
+  const loadCleanup = useCallback(async () => {
+    setCleanup(await api<Cleanup[]>("cleanup"));
+  }, []);
   const [sources, setSources] = useState<Source[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [drafts, setDrafts] = useState<Draft[]>(savedBatch);
+  const [counts, setCounts] = useState({
+    awaiting: 0,
+    unfinished: 0,
+    running: 0,
+    queued: 0,
+    cleanup: 0,
+  });
   const [history, setHistory] = useState(50);
   const [more, setMore] = useState(false);
   const [error, setError] = useState("");
@@ -39,8 +73,17 @@ export default function App() {
     let timer: ReturnType<typeof setTimeout>;
     async function refresh() {
       try {
-        if (tab === "Library") await reload();
-        if (tab === "Jobs") await loadJobs();
+        const [status] = await Promise.all([
+          api<typeof counts>("status"),
+          tab === "Library"
+            ? reload()
+            : tab === "Jobs"
+              ? loadJobs()
+              : tab === "Processed"
+                ? loadCleanup()
+                : undefined,
+        ]);
+        if (active) setCounts(status);
         if (active) setError("");
       } catch (e) {
         if (active) setError((e as Error).message);
@@ -52,7 +95,7 @@ export default function App() {
       active = false;
       clearTimeout(timer);
     };
-  }, [tab, reload, loadJobs]);
+  }, [tab, reload, loadJobs, loadCleanup]);
   useEffect(() => {
     try {
       sessionStorage.setItem(draftStorage, JSON.stringify(drafts));
@@ -66,6 +109,31 @@ export default function App() {
       return [...previous, ...items.filter((d) => !keys.has(draftKey(d.source, d.title)))];
     });
   }
+  function stage(draft: Draft) {
+    const key = draftKey(draft.source, draft.title);
+    setDrafts((items) =>
+      items.some((d) => draftKey(d.source, d.title) === key)
+        ? items.map((d) => (draftKey(d.source, d.title) === key ? draft : d))
+        : [...items, draft],
+    );
+  }
+  function scheduled(draft: Draft, seasonSources?: number[]) {
+    const key = draftKey(draft.source, draft.title);
+    setDrafts((items) =>
+      items.filter((d) =>
+        seasonSources ? !seasonSources.includes(d.source.id) : draftKey(d.source, d.title) !== key,
+      ),
+    );
+    remembered.current.delete(key);
+    reload().catch((e) => setError(e.message));
+  }
+  const badges = {
+    Library: counts.awaiting,
+    Batch: drafts.length,
+    Jobs: counts.unfinished,
+    Processed: counts.cleanup,
+    Settings: 0,
+  };
   return (
     <>
       <header className="mast">
@@ -78,14 +146,18 @@ export default function App() {
             {tabs.map((t) => (
               <button
                 key={t}
+                aria-label={t}
                 aria-current={t === tab ? "page" : undefined}
                 onClick={() => setTab(t)}
               >
                 {t}
-                {t === "Batch" && drafts.length > 0 && <b>{drafts.length}</b>}
+                {badges[t] > 0 && <b>{badges[t]}</b>}
               </button>
             ))}
           </nav>
+          {counts.running > 0 && (
+            <span className="worker-active">Worker active · {counts.running} running</span>
+          )}
         </div>
       </header>
       <main>
@@ -94,18 +166,30 @@ export default function App() {
             {error}
           </p>
         )}
-        {tab === "Library" && (
+        {configError && (
+          <p role="alert" className="alert">
+            {configError} <button onClick={() => retryConfig((n) => n + 1)}>Retry</button>
+          </p>
+        )}
+        {!settings && !configError && <p role="status">Loading settings…</p>}
+        {tab === "Library" && settings && prefs && (
           <Library
             sources={sources}
+            settings={settings}
+            prefs={prefs}
+            remembered={remembered.current}
+            stage={stage}
+            scheduled={scheduled}
             drafts={drafts}
             add={add}
             reload={reload}
             review={() => setTab("Batch")}
           />
         )}
-        {tab === "Batch" && (
+        {tab === "Batch" && settings && (
           <Batch
             drafts={drafts}
+            settings={settings}
             change={setDrafts}
             finish={() => {
               setDrafts([]);
@@ -120,6 +204,12 @@ export default function App() {
             more={more}
             loadMore={() => setHistory((n) => n + 50)}
           />
+        )}
+        {tab === "Processed" && settings && (
+          <Processed items={cleanup} settings={settings} reload={loadCleanup} />
+        )}
+        {tab === "Settings" && settings && prefs && (
+          <SettingsPage settings={settings} prefs={prefs} save={setPrefs} />
         )}
       </main>
     </>

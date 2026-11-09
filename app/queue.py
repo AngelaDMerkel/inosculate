@@ -6,7 +6,7 @@ from sqlite3 import Connection
 from .catalog import LANGUAGES
 from .config import settings
 from .db import connect, now, row, transaction
-from .util import ensure_beneath, json_load, safe_component, safe_relative_mkv
+from .util import ensure_beneath, json_load, safe_relative_mkv
 
 
 def _prepared_job(source: dict, body: dict) -> dict:
@@ -69,14 +69,18 @@ def _prepared_job(source: dict, body: dict) -> dict:
         if str(track_key) not in available or not isinstance(value, dict):
             continue
         language = str(value.get("language", "")).strip().lower()
-        name = safe_component(str(value.get("name", "")).strip(), "")
+        name = "".join(c for c in str(value.get("name", "")).strip() if c.isprintable())[:180]
         if language and language not in language_codes:
             raise ValueError(f"Unsupported track language: {language}")
-        if language or name:
-            overrides[str(track_key)] = {
-                "language": language,
-                "name": name,
-            }
+        changes = {}
+        if language:
+            changes["language"] = language
+        if name:
+            changes["name"] = name
+        elif value.get("clear_name") is True:
+            changes["clear_name"] = True
+        if changes:
+            overrides[str(track_key)] = changes
     return {
         "source_id": int(source["id"]),
         "title_id": title_id,
@@ -154,7 +158,7 @@ def schedule_batch(items: list[dict]) -> list[int]:
 def activity(history: int) -> dict:
     history = max(1, min(2**31 - 1, history))
     summary = """SELECT jobs.id, title_id, relative_path, output_path, status,
-                        phase, progress, cancel_requested, error, sources.name AS source_name
+                        phase, progress, cancel_requested, error, jobs.started_at, jobs.created_at, sources.name AS source_name
                    FROM jobs JOIN sources ON sources.id=jobs.source_id"""
     active = "('queued','running','awaiting_overwrite','retryable')"
     connection = connect()

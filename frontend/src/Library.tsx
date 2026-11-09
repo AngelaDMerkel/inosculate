@@ -1,5 +1,16 @@
 import { useEffect, useState } from "react";
-import { api, Detail, Draft, draftFor, draftKey, duration, formats, Source, Title } from "./model";
+import SourceEditor from "./SourceEditor";
+import {
+  api,
+  Detail,
+  Draft,
+  draftFor,
+  draftKey,
+  formats,
+  Preferences,
+  Settings,
+  Source,
+} from "./model";
 
 const states: Record<string, string> = {
   discovered: "Uninspected",
@@ -14,9 +25,54 @@ interface Props {
   add: (items: Draft[]) => void;
   reload: () => Promise<void>;
   review: () => void;
+  settings: Settings;
+  prefs: Preferences;
+  stage: (draft: Draft) => void;
+  scheduled: (draft: Draft, seasonSources?: number[]) => void;
+  remembered: Map<string, Draft>;
 }
 
-export default function Library({ sources, drafts, add, reload, review }: Props) {
+export default function Library({
+  sources,
+  drafts,
+  add,
+  reload,
+  review,
+  settings,
+  prefs,
+  stage,
+  scheduled,
+  remembered,
+}: Props) {
+  const [state, setState] = useState("available");
+  const [analyses, setAnalyses] = useState<
+    {
+      series_name: string;
+      season_number: number;
+      status: string;
+      inspected: number;
+      total: number;
+      matching: number;
+      exceptions: number;
+    }[]
+  >([]);
+  const seasonStatus = sources
+    .filter((s) => s.series_name && s.kind === "file")
+    .map((s) => [s.id, s.probe_status, s.queue_state].join("/"))
+    .join(",");
+  useEffect(() => {
+    let active = true;
+    api<typeof analyses>("seasons")
+      .then((a) => {
+        if (active) setAnalyses(a);
+      })
+      .catch((e) => {
+        if (active) setError(e.message);
+      });
+    return () => {
+      active = false;
+    };
+  }, [seasonStatus]);
   const [kind, setKind] = useState("all");
   const [query, setQuery] = useState("");
   const [focus, setFocus] = useState<number | null>(null);
@@ -28,6 +84,8 @@ export default function Library({ sources, drafts, add, reload, review }: Props)
   const current = sources.find((s) => s.id === focus);
   const visible = sources.filter(
     (s) =>
+      (state === "all" ||
+        (state === "available" ? s.queue_state !== "deferred" : s.queue_state === state)) &&
       (kind === "all" || (kind === "disc") === (s.kind !== "file")) &&
       (s.name.toLowerCase().includes(query.toLowerCase()) ||
         s.path.toLowerCase().includes(query.toLowerCase())),
@@ -79,13 +137,6 @@ export default function Library({ sources, drafts, add, reload, review }: Props)
     setMessage([`Found ${result.found} sources.`, ...result.warnings].join(" "));
     await reload();
   }
-  async function addTitle(source: Source, title: Title) {
-    const full = title.tracks
-      ? title
-      : await api<Title>(`sources/${source.id}/titles/${title.id}`, {});
-    add([draftFor(source, full)]);
-    setMessage(`${title.name} added to the batch.`);
-  }
   async function bulkFiles() {
     if (unread.length) {
       await inspect(unread);
@@ -98,7 +149,8 @@ export default function Library({ sources, drafts, add, reload, review }: Props)
       const title = file.metadata.titles?.[0];
       if (!title?.tracks) throw new Error(`Inspect ${file.name} before adding it.`);
       const { metadata: _catalog, ...source } = file;
-      return draftFor(source, title);
+      const prior = remembered.get(draftKey(source, title));
+      return prior?.source.mtime === source.mtime ? prior : draftFor(source, title);
     });
     add(results);
     setMarked([]);
@@ -108,6 +160,128 @@ export default function Library({ sources, drafts, add, reload, review }: Props)
     const ids = visibleFiles.map((s) => s.id);
     if (ids.every((id) => marked.includes(id))) setMarked(marked.filter((id) => !ids.includes(id)));
     else setMarked([...new Set([...marked, ...ids])]);
+  }
+  const groups = Array.from(
+    visible
+      .reduce((map, s) => {
+        const series = s.kind === "file" ? s.series_name : undefined;
+        const season = s.season_number ?? 1;
+        const key = series ? JSON.stringify([series, season]) : "others";
+        if (!map.has(key)) map.set(key, { key, series, season, items: [] });
+        map.get(key)!.items.push(s);
+        return map;
+      }, new Map<string, { key: string; series?: string; season: number; items: Source[] }>())
+      .values(),
+  );
+  function renderSource(s: Source) {
+    const open = focus === s.id;
+    return (
+      <li key={s.id} className={"library-row" + (open ? " focused" : "")}>
+        <div className="source-bar">
+          {s.kind === "file" && (
+            <input
+              type="checkbox"
+              aria-label={"Select " + s.name}
+              checked={marked.includes(s.id)}
+              onChange={(e) =>
+                setMarked(e.target.checked ? [...marked, s.id] : marked.filter((id) => id !== s.id))
+              }
+            />
+          )}
+          <button
+            className="source"
+            aria-expanded={open}
+            onClick={() => {
+              setFocus(open ? null : s.id);
+              setError("");
+              if (!open && s.probe_status === "discovered" && !busy) run(() => inspect([s]));
+            }}
+          >
+            <span aria-hidden="true" className={s.kind === "file" ? "file-icon" : "disc"} />
+            <span className="source-name">
+              <strong>{s.name}</strong>
+              <small>
+                {formats[s.kind]} · {s.path}
+              </small>
+            </span>
+            <span className={"status " + s.probe_status}>
+              {states[s.probe_status] || s.probe_status}
+            </span>
+            <span>{open ? "Close" : "Review"}</span>
+          </button>
+        </div>
+        {open && (
+          <section className="inline-review" aria-label="Source review">
+            {s.probe_status === "ready" && detail?.id === s.id ? (
+              <SourceEditor
+                key={s.id + "/" + s.mtime}
+                source={detail}
+                settings={settings}
+                prefs={prefs}
+                staged={drafts}
+                remembered={remembered}
+                stage={stage}
+                scheduled={scheduled}
+                notify={setMessage}
+              />
+            ) : s.probe_status === "error" || s.probe_status === "discovered" ? (
+              <>
+                {s.probe_error && <p className="alert">{s.probe_error}</p>}
+                <button onClick={() => run(() => inspect([s]))}>Inspect source</button>
+              </>
+            ) : (
+              <p role="status">
+                {s.probe_status === "ready" ? "Loading track details…" : "Inspecting source…"}
+              </p>
+            )}
+            {["awaiting", "deferred"].includes(s.queue_state) && (
+              <details>
+                <summary>Original source actions</summary>
+                <div className="actions">
+                  {(s.queue_state === "deferred" ? ["resume"] : ["defer"])
+                    .concat(settings.trash_enabled ? ["trash", "delete"] : ["delete"])
+                    .map((action) => (
+                      <button
+                        key={action}
+                        disabled={busy}
+                        onClick={() =>
+                          run(async () => {
+                            const destructive = action === "delete" || action === "trash";
+                            if (
+                              destructive &&
+                              !window.confirm(`${action === "trash" ? "Move to trash" : "Permanently delete"}?
+
+${s.path}`)
+                            )
+                              return;
+                            await api(`sources/${s.id}/disposition`, {
+                              action,
+                              confirm: destructive,
+                            });
+                            await reload();
+                            setMessage(`Source decision saved for ${s.name}`);
+                          })
+                        }
+                      >
+                        {
+                          (
+                            {
+                              resume: "Return to awaiting",
+                              defer: "Defer source",
+                              trash: "Move to trash",
+                              delete: "Delete permanently",
+                            } as Record<string, string>
+                          )[action]
+                        }
+                      </button>
+                    ))}
+                </div>
+              </details>
+            )}
+          </section>
+        )}
+      </li>
+    );
   }
   return (
     <section className="page">
@@ -147,6 +321,12 @@ export default function Library({ sources, drafts, add, reload, review }: Props)
             </button>
           ))}
         </div>
+        <select aria-label="Queue state" value={state} onChange={(e) => setState(e.target.value)}>
+          <option value="available">Available sources</option>
+          <option value="awaiting">Awaiting decision</option>
+          <option value="deferred">Deferred</option>
+          <option value="all">All states</option>
+        </select>
         <input
           type="search"
           aria-label="Search sources"
@@ -155,7 +335,7 @@ export default function Library({ sources, drafts, add, reload, review }: Props)
           onChange={(e) => setQuery(e.target.value)}
         />
       </div>
-      <div className={"workspace" + (current ? " split" : "")}>
+      <div className="workspace">
         <div className="inventory">
           <div className="list-head">
             <span>
@@ -207,107 +387,53 @@ export default function Library({ sources, drafts, add, reload, review }: Props)
             </div>
           )}
           <ul className="source-list">
-            {visible.map((s) => (
-              <li className={focus === s.id ? "focused" : ""} key={s.id}>
-                {s.kind === "file" && (
-                  <input
-                    type="checkbox"
-                    aria-label={"Select " + s.name}
-                    checked={marked.includes(s.id)}
-                    onChange={(e) =>
-                      setMarked(
-                        e.target.checked ? [...marked, s.id] : marked.filter((id) => id !== s.id),
-                      )
-                    }
-                  />
-                )}
-                <button
-                  className="source"
-                  aria-expanded={focus === s.id}
-                  onClick={() => {
-                    setFocus(s.id);
-                    setError("");
-                    if (s.probe_status === "discovered" && !busy) run(() => inspect([s]));
-                  }}
-                >
-                  <span aria-hidden="true" className={s.kind === "file" ? "file-icon" : "disc"} />
-                  <span className="source-name">
-                    <strong>{s.name}</strong>
-                    <small>{formats[s.kind]}</small>
-                  </span>
-                  <span className={"status " + s.probe_status}>
-                    {states[s.probe_status] || s.probe_status}
-                  </span>
-                </button>
-              </li>
-            ))}
+            {groups.map((group) =>
+              group.series ? (
+                <li className="series-group" key={group.key}>
+                  <details open>
+                    <summary>
+                      {group.series} · Season {group.season} ({group.items.length})
+                    </summary>
+                    {(() => {
+                      const analysis = analyses.find(
+                        (a) => a.series_name === group.series && a.season_number === group.season,
+                      );
+                      return (
+                        <div className="season-facts">
+                          <small>
+                            {analysis?.status === "mixed"
+                              ? `${analysis.matching} matching · ${analysis.exceptions} exceptions`
+                              : analysis?.status === "uniform"
+                                ? "Uniform track layout"
+                                : `${analysis?.inspected || 0} inspected`}
+                          </small>
+                          <button
+                            disabled={busy || !analysis}
+                            onClick={() =>
+                              run(async () => {
+                                const r = await api<{ queued: number }>("seasons/analyze", {
+                                  series_name: group.series,
+                                  season_number: group.season,
+                                });
+                                setMessage(`Season analysis: ${r.queued} inspections queued.`);
+                                await reload();
+                              })
+                            }
+                          >
+                            Analyze season
+                          </button>
+                        </div>
+                      );
+                    })()}
+                    <ul className="source-list">{group.items.map(renderSource)}</ul>
+                  </details>
+                </li>
+              ) : (
+                group.items.map(renderSource)
+              ),
+            )}
           </ul>
         </div>
-        {current && (
-          <aside className="inspector" aria-label="Source details">
-            <header>
-              <small>{formats[current.kind]}</small>
-              <button className="quiet" onClick={() => setFocus(null)}>
-                Close
-              </button>
-            </header>
-            <h2>{current.name}</h2>
-            <p className="path">{current.path}</p>
-            {current.probe_status === "error" ? (
-              <>
-                <p className="alert">{current.probe_error}</p>
-                <button disabled={busy} onClick={() => run(() => inspect([current]))}>
-                  Retry inspection
-                </button>
-              </>
-            ) : current.probe_status !== "ready" ? (
-              <p role="status">
-                {states[current.probe_status]}.{" "}
-                {current.probe_status === "discovered" && (
-                  <button onClick={() => run(() => inspect([current]))}>Inspect source</button>
-                )}
-              </p>
-            ) : !detail ? (
-              <p>Loading titles…</p>
-            ) : (
-              <>
-                <h3>{current.kind === "file" ? "Media file" : "Disc titles"}</h3>
-                {current.kind !== "file" && <p>Choose each title you want to keep.</p>}
-                <div className="titles">
-                  {detail.metadata.titles?.map((t) => {
-                    const staged = drafts.some(
-                      (d) => draftKey(current, t) === draftKey(d.source, d.title),
-                    );
-                    return (
-                      <div className="title" key={t.id}>
-                        <div>
-                          <strong>{t.name}</strong>
-                          <small>
-                            {duration(t.duration)}
-                            {t.chapters != null
-                              ? ` · ${t.chapters} ${t.chapters === 1 ? "chapter" : "chapters"}`
-                              : ""}
-                          </small>
-                        </div>
-                        <button
-                          disabled={busy || staged}
-                          onClick={() => run(() => addTitle(current, t))}
-                        >
-                          {staged ? "Added" : "Add to batch"}
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-                {drafts.length > 0 && (
-                  <button className="primary full" onClick={review}>
-                    Review batch ({drafts.length})
-                  </button>
-                )}
-              </>
-            )}
-          </aside>
-        )}
       </div>
     </section>
   );

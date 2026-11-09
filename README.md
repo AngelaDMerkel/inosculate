@@ -28,13 +28,17 @@ docker compose up --build -d
 
 Open `http://YOUR-NAS:8787` on your trusted local network. `WEB_PORT` changes the host port. Compose builds the image from this checkout. The service has no authentication.
 
-## Select a batch
+## Review a source and its tracks
 
-1. In **Library**, scan the import folder. Open a source to inspect it, or choose **Inspect visible** to catalog the filtered list in the background.
-2. For each disc, add the titles or playlists you want. Duration and chapter count help distinguish features, episodes, and extras. Scanning and inspection leave every disc title unselected.
-3. For existing episodes or movies, select individual files or all visible files. Inspect them and choose **Review files** to add them together.
-4. In **Batch**, choose Movies or Television and a relative filename for each output. All supported tracks start selected. Use **Batch track selection** to keep particular audio or subtitle languages or drop all subtitles. Expand **Tracks** to sample audio or subtitles and remove individual streams such as commentary. When a requested audio language is missing, the previous audio choice is retained for that file.
-5. **Queue jobs** submits the whole batch. **Jobs** shows progress, errors, logs, cancellation, and retry. Each title produces its own file. The worker checks track counts and duration before publishing, and keeps the original source.
+1. In **Library**, scan the import folder and click **Review** beside a source. Its editor opens in place. For a disc, choose the DVD title or Blu-ray playlist explicitly.
+2. Each video, audio, and subtitle row has its own inclusion checkbox. Click **Listen** beside an audio track, then play its sample. You can listen while the track is unchecked. The player identifies the source, title, and track ID. **Preview subtitles** shows text or a frame from the selected subtitle stream.
+3. Choose **Preferred**, **Minimal**, or **All tracks**, or check tracks individually. You can correct the language and name on audio and subtitle rows. **Settings** controls preferred audio and subtitle languages, forced subtitles, and ignored scan patterns.
+4. Choose Movies or Television, select an existing directory or enter a new subdirectory, and review the full destination. **Schedule remux** queues this title directly. **Add to batch** carries your exact track choices, labels, and destination into **Batch**.
+5. For television files, **Analyze season** compares track layouts. **Apply as season template** shows the matching episodes and exceptions, lets you select episodes, and schedules only after you confirm the preflight.
+
+For bulk file cleanup, select files in **Library** and choose **Review files**. In **Batch**, apply language choices across files or expand **Tracks** to adjust or sample an individual track. **Queue jobs** submits the batch. **Jobs** shows progress, errors, logs, cancellation, and retry.
+
+**Processed** lists verified outputs and their original paths. Choose **Keep original**, **Decide later**, **Move to trash**, or **Delete permanently**. Unscheduled sources have their own **Original source actions** in the editor, including defer and resume. Trash and deletion require confirmation. Write access to the import mount is needed for those two actions.
 
 ## Media readers
 

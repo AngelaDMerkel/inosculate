@@ -185,6 +185,10 @@ def initialize() -> None:
                  WHERE kind IN ('dvd','bluray','iso')
             """)
             connection.execute("PRAGMA user_version=1")
+        if connection.execute("PRAGMA user_version").fetchone()[0] < 2:
+            # Previously cached samples were selected by a cross-reader ordinal.
+            connection.execute("UPDATE previews SET source_mtime=NULL WHERE preview_type='audio'")
+            connection.execute("PRAGMA user_version=2")
         connection.commit()
     finally:
         connection.close()

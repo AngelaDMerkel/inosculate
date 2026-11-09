@@ -1,3 +1,4 @@
+import array
 import hashlib
 import json
 import shutil
@@ -12,9 +13,11 @@ from app.db import initialize, now, row, rows, transaction
 from app.discs import bluray_titles, dvd_titles, ffmpeg_input
 from app.library import queue_inspections, title_details
 from app.media import inspect_output
+from app.previews import preview_once
 from app.queue import schedule_batch
 from app.scanner import discover
 from app.worker import probe_once, remux_once
+from app.web import Handler
 
 
 class DiscCatalogTests(unittest.TestCase):
@@ -95,6 +98,66 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(row("SELECT status FROM jobs WHERE id=?", (completed,))["status"], "complete")
         self.assertIsNone(row("SELECT metadata_json FROM sources")["metadata_json"])
 
+    def test_cleanup_cannot_remove_a_disc_while_another_title_is_queued(self):
+        source_id = self.insert_disc()
+        path = settings.ingest_dir / "Disc.iso"
+        path.write_bytes(b"fixture")
+        stat = path.stat()
+        with transaction() as connection:
+            connection.execute("UPDATE sources SET path=?,size=?,mtime=? WHERE id=?",
+                               (str(path), stat.st_size, stat.st_mtime, source_id))
+        first, second = schedule_batch([self.item(source_id, "dvd:1", "one"),
+                                        self.item(source_id, "dvd:2", "two")])
+        with transaction() as connection:
+            connection.execute("UPDATE jobs SET status='complete' WHERE id=?", (first,))
+            cleanup = connection.execute("INSERT INTO cleanup (job_id,source_id,created_at) VALUES (?,?,?)",
+                                         (first, source_id, now())).lastrowid
+        handler = object.__new__(Handler)
+        with self.assertRaisesRegex(ValueError, "active or retryable"):
+            handler._cleanup_action(cleanup, {"confirm": True, "decision": "delete"})
+        self.assertTrue(path.exists())
+        with transaction() as connection:
+            connection.execute("UPDATE jobs SET status='cancelled' WHERE id=?", (second,))
+            connection.execute("UPDATE sources SET mtime=mtime+1 WHERE id=?", (source_id,))
+        with self.assertRaisesRegex(ValueError, "changed since this output"):
+            handler._cleanup_action(cleanup, {"confirm": True, "decision": "delete"})
+        self.assertTrue(path.exists())
+
+    @unittest.skipUnless(all(shutil.which(tool) for tool in ("ffmpeg", "mkvmerge", "ffprobe")),
+                         "media tools are required for audio preview verification")
+    def test_each_preview_uses_the_audio_id_selected_by_the_muxer(self):
+        path = settings.ingest_dir / "Two tones.mkv"
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440",
+                        "-f", "lavfi", "-i", "sine=frequency=880", "-map", "0:a", "-map", "1:a",
+                        "-t", "2", "-c:a", "flac", str(path)], check=True)
+        discover()
+        source = row("SELECT * FROM sources")
+        queue_inspections([source["id"]])
+        self.assertTrue(probe_once())
+        metadata = json.loads(row("SELECT metadata_json FROM sources")["metadata_json"])
+        tracks = metadata["titles"][0]["tracks"]
+        with transaction() as connection:
+            for track in tracks:
+                # Cross-reader ordinals are not stable track identities.
+                track["ordinal"] = 0
+                connection.execute("""
+                    INSERT INTO previews (source_id,title_id,track_key,created_at,updated_at)
+                    VALUES (?,'0',?,?,?)
+                """, (source["id"], track["key"], now(), now()))
+            connection.execute("UPDATE sources SET metadata_json=?", (json.dumps(metadata),))
+        self.assertTrue(preview_once())
+        self.assertTrue(preview_once())
+        previews = rows("SELECT * FROM previews ORDER BY id")
+        self.assertEqual(len(previews), 2)
+        for preview, expected_hz in zip(previews, (440, 880)):
+            self.assertEqual(preview["status"], "complete", preview["error"])
+            data = subprocess.check_output(["ffmpeg", "-v", "error", "-i", preview["path"],
+                                            "-ss", "0.2", "-t", "1", "-ac", "1", "-ar", "8000",
+                                            "-f", "s16le", "-"])
+            samples = array.array("h", data)
+            crossings = sum(a <= 0 < b for a, b in zip(samples, samples[1:]))
+            self.assertAlmostEqual(crossings * 8000 / len(samples), expected_hz, delta=3)
+
     @unittest.skipUnless(all(shutil.which(tool) for tool in ("ffmpeg", "ffprobe", "mkvmerge")),
                          "media tools are required for the remux integration test")
     def test_remux_existing_episode_keeps_selected_audio_and_drops_subtitles(self):
@@ -118,12 +181,14 @@ class BatchTests(unittest.TestCase):
                 (t["type"] == "audio" and t["language"] in {"fra", "fre", "fr"})]
         self.assertEqual(len(keys), 2)
         request = {**self.item(source["id"], "0", "Season 02/Example.S02E03.mkv"),
-                   "selected_tracks": keys, "output_kind": "television"}
+                   "selected_tracks": keys, "output_kind": "television",
+                   "track_overrides": {keys[1]: {"name":"French dialogue","language":"fra"}}}
         schedule_batch([request])
         self.assertTrue(remux_once())
         job = row("SELECT * FROM jobs")
         self.assertEqual(job["status"], "complete", job["error"])
         tracks = inspect_output(Path(job["output_path"]))["titles"][0]["tracks"]
         self.assertEqual([t["type"] for t in tracks], ["video", "audio"])
+        self.assertEqual(tracks[1]["name"], "French dialogue")
         self.assertIn(tracks[1]["language"], {"fra", "fre", "fr"})
         self.assertEqual(hashlib.sha256(path.read_bytes()).digest(), digest)

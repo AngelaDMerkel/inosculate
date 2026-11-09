@@ -221,12 +221,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(self._directories(kind))
             elif parts == ["api", "seasons"]:
                 self._send_json(self._season_summaries())
+            elif parts == ["api", "status"]:
+                self._send_json(row("""
+                    SELECT (SELECT count(*) FROM sources WHERE present=1 AND queue_state IN ('awaiting','deferred')) AS awaiting,
+                           (SELECT count(*) FROM jobs WHERE status<>'complete') AS unfinished,
+                           (SELECT count(*) FROM jobs WHERE status='running') AS running,
+                           (SELECT count(*) FROM jobs WHERE status='queued') AS queued,
+                           (SELECT count(*) FROM cleanup WHERE status IN ('pending','deferred','error')) AS cleanup
+                """))
             elif parts == ["api", "activity"]:
                 self._send_json(activity(int(self._query().get("history", ["50"])[0])))
             elif parts == ["api", "library"]:
                 self._send_json(rows("""
                     SELECT id, name, path, kind, size, mtime, probe_status, probe_error,
-                           queue_state, series_name, season_number, episode_number
+                           queue_state, series_name, season_number, episode_number, episode_title
                       FROM sources WHERE present=1 AND queue_state NOT IN ('removed','trashed','deleted')
                      ORDER BY name COLLATE NOCASE, path
                 """))
@@ -458,7 +466,7 @@ class Handler(BaseHTTPRequestHandler):
         found = rows(
             """
             SELECT * FROM sources
-             WHERE present=1
+             WHERE present=1 AND kind='file'
                AND queue_state IN ('awaiting', 'deferred')
                AND series_name IS NOT NULL
              ORDER BY series_name COLLATE NOCASE, season_number, episode_number
@@ -585,6 +593,7 @@ class Handler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "scheduled": len(job_ids),
+                "source_ids": [job["source_id"] for job in prepared_jobs],
                 "job_ids": job_ids,
                 "exceptions": plan["exceptions"],
             },
@@ -592,75 +601,61 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _source_disposition(self, source_id: int, body: dict) -> None:
-        source = row("SELECT * FROM sources WHERE id=?", (source_id,))
-        if not source or not source["present"]:
-            raise ValueError("Source was not found in the current inventory")
         action = str(body.get("action", ""))
-        if source["queue_state"] not in {"awaiting", "deferred"}:
-            raise ValueError(
-                "Only sources awaiting a queue decision can be changed here"
-            )
-        if action in {"defer", "resume"}:
-            state = "deferred" if action == "defer" else "awaiting"
-            with transaction() as connection:
-                connection.execute(
-                    "UPDATE sources SET queue_state=?, updated_at=? WHERE id=?",
-                    (state, now(), source_id),
-                )
-            self._send_json({"ok": True, "queue_state": state})
-            return
-        if action not in {"trash", "delete"} or body.get("confirm") is not True:
-            raise ValueError("Source removal requires explicit confirmation")
-        if row(
-            """
-            SELECT id FROM jobs
-             WHERE source_id=?
-               AND status NOT IN ('complete', 'failed', 'cancelled')
-             LIMIT 1
-            """,
-            (source_id,),
-        ):
-            raise ValueError("This source still has an active remux job")
-
-        source_path = ensure_beneath(Path(source["path"]), settings.ingest_dir)
-        if action == "trash":
-            if not settings.trash_dir:
-                raise ValueError("The ingest trash directory is not configured")
-            settings.trash_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-            destination = settings.trash_dir / f"{source_path.name}.{stamp}"
-            counter = 1
-            while destination.exists():
-                destination = (
-                    settings.trash_dir
-                    / f"{source_path.name}.{counter}.{stamp}"
-                )
-                counter += 1
-            if source_path.exists():
-                shutil.move(str(source_path), str(destination))
-            decision = "trashed"
-        else:
-            if source_path.is_dir():
-                shutil.rmtree(source_path)
+        with transaction(immediate=True) as connection:
+            source = connection.execute("SELECT * FROM sources WHERE id=? AND present=1", (source_id,)).fetchone()
+            if not source or source["queue_state"] not in {"awaiting", "deferred"}:
+                raise ValueError("Only sources awaiting a queue decision can be changed here")
+            if action in {"defer", "resume"}:
+                state = "deferred" if action == "defer" else "awaiting"
+                connection.execute("UPDATE sources SET queue_state=?, updated_at=? WHERE id=?",
+                                   (state, now(), source_id))
+                result = {"ok": True, "queue_state": state}
+            elif action in {"trash", "delete"} and body.get("confirm") is True:
+                decision = self._remove_original(connection, source, action)
+                result = {"ok": True, "decision": decision}
             else:
-                source_path.unlink(missing_ok=True)
-            decision = "deleted"
-        with transaction() as connection:
-            connection.execute(
-                """
-                UPDATE sources
-                   SET present=0, queue_state='removed', updated_at=?
-                 WHERE id=?
-                """,
-                (now(), source_id),
-            )
-        self._send_json({"ok": True, "decision": decision})
+                raise ValueError("Source removal requires explicit confirmation")
+        self._send_json(result)
+
+    @staticmethod
+    def _remove_original(connection, source, action: str) -> str:
+        # Serialize removal with scheduling, worker claims and retry decisions.
+        active = connection.execute("""
+            SELECT id FROM jobs WHERE source_id=? AND status IN
+                ('queued','running','retryable','awaiting_overwrite') LIMIT 1
+        """, (source["id"],)).fetchone()
+        if active:
+            raise ValueError("This source still has an active or retryable remux job")
+        path = ensure_beneath(Path(source["path"]), settings.ingest_dir)
+        if path == settings.ingest_dir:
+            raise ValueError("The import directory cannot be removed")
+        if path.exists():
+            stat = path.stat()
+            if stat.st_mtime != source["mtime"] or (path.is_file() and stat.st_size != source["size"]):
+                raise ValueError("The original has changed since inspection. Review it again.")
+            if action == "trash":
+                if not settings.trash_dir:
+                    raise ValueError("The ingest trash directory is not configured")
+                settings.trash_dir.mkdir(parents=True, exist_ok=True)
+                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+                destination = settings.trash_dir / f"{path.name}.{source['id']}.{stamp}"
+                shutil.move(str(path), str(destination))
+            elif path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        connection.execute("UPDATE sources SET present=0, queue_state='removed', updated_at=? WHERE id=?",
+                           (now(), source["id"]))
+        return "trashed" if action == "trash" else "deleted"
 
     def _create_job(self, body: dict) -> None:
         source = row("SELECT * FROM sources WHERE id=?", (int(body["source_id"]),))
         if not source:
             raise ValueError("This source was not found")
         try:
+            if body.get("mtime", source["mtime"]) != source["mtime"]:
+                raise ValueError("The source changed. Inspect it again.")
             prepared = _prepared_job(source, body)
         except FileExistsError as error:
             self._send_json(
@@ -673,7 +668,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         timestamp = now()
-        with transaction() as connection:
+        with transaction(immediate=True) as connection:
             job_id = _insert_prepared_job(connection, prepared, timestamp)
         self._send_json({"id": job_id, "status": "queued"}, HTTPStatus.CREATED)
 
@@ -703,6 +698,9 @@ class Handler(BaseHTTPRequestHandler):
                 "cancelled",
                 "retryable",
             }:
+                if not connection.execute("SELECT id FROM sources WHERE id=? AND present=1 AND queue_state<>'removed'",
+                                          (job["source_id"],)).fetchone():
+                    raise ValueError("The original source is no longer available")
                 if connection.execute("""
                     SELECT id FROM jobs WHERE id<>? AND status IN ('queued','running','awaiting_overwrite')
                      AND (output_path=? OR (source_id=? AND title_id=?))
@@ -765,113 +763,31 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(result, HTTPStatus.OK if existing else HTTPStatus.CREATED)
 
     def _cleanup_action(self, cleanup_id: int, body: dict) -> None:
-        item = row(
-            """
-            SELECT cleanup.*, sources.path, sources.kind, sources.present
-              FROM cleanup JOIN sources ON sources.id=cleanup.source_id
-             WHERE cleanup.id=?
-            """,
-            (cleanup_id,),
-        )
-        if not item:
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
         decision = body.get("decision")
-        if decision == "later":
-            with transaction() as connection:
-                connection.execute(
-                    """
-                    UPDATE cleanup SET status='deferred', decision='later',
-                           decided_at=? WHERE id=?
-                    """,
-                    (now(), cleanup_id),
-                )
-            self._send_json({"ok": True})
-            return
-        if decision == "keep":
-            with transaction() as connection:
-                connection.execute(
-                    """
-                    UPDATE cleanup SET status='complete', decision='keep',
-                           decided_at=? WHERE id=?
-                    """,
-                    (now(), cleanup_id),
-                )
-            self._send_json({"ok": True})
-            return
-        if decision not in {"trash", "delete"} or body.get("confirm") is not True:
-            raise ValueError("Deletion requires explicit confirmation")
-
-        source_path = ensure_beneath(Path(item["path"]), settings.ingest_dir)
-        try:
-            active_job = row(
-                """
-                SELECT id FROM jobs
-                 WHERE source_id=? AND status NOT IN ('complete', 'failed', 'cancelled')
-                 LIMIT 1
-                """,
-                (item["source_id"],),
-            )
-            if active_job:
-                raise ValueError(
-                    "This source still has an active or retryable remux job"
-                )
-            if decision == "trash":
-                if not settings.trash_dir:
-                    raise ValueError("The ingest trash directory is not configured")
-                settings.trash_dir.mkdir(parents=True, exist_ok=True)
-                destination = settings.trash_dir / (
-                    f"{source_path.name}.{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
-                )
-                counter = 1
-                while destination.exists():
-                    destination = settings.trash_dir / (
-                        f"{source_path.name}.{counter}."
-                        f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
-                    )
-                    counter += 1
-                shutil.move(str(source_path), str(destination))
-                final_decision = "trashed"
-            elif source_path.is_dir():
-                shutil.rmtree(source_path)
-                final_decision = "deleted"
+        with transaction(immediate=True) as connection:
+            item = connection.execute("""
+                SELECT cleanup.*, jobs.input_json FROM cleanup JOIN jobs ON jobs.id=cleanup.job_id
+                 WHERE cleanup.id=?
+            """, (cleanup_id,)).fetchone()
+            if not item or item["status"] == "complete":
+                raise ValueError("This original-source decision is no longer pending")
+            if decision in {"later", "keep"}:
+                status = "complete" if decision == "keep" else "deferred"
+                connection.execute("UPDATE cleanup SET status=?,decision=?,error=NULL,decided_at=? WHERE id=?",
+                                   (status, decision, now(), cleanup_id))
+            elif decision in {"trash","delete"} and body.get("confirm") is True:
+                source = connection.execute("SELECT * FROM sources WHERE id=?", (item["source_id"],)).fetchone()
+                verified = json_load(item["input_json"], {})
+                if verified and (verified["mtime"] != source["mtime"] or verified["size"] != source["size"]):
+                    raise ValueError("The original has changed since this output was verified")
+                decision = self._remove_original(connection, source, decision)
+                connection.execute("""
+                    UPDATE cleanup SET status='complete', decision=CASE WHEN id=? THEN ? ELSE 'source_removed' END,
+                        error=NULL, decided_at=? WHERE source_id=? AND status IN ('pending','deferred','error')
+                """, (cleanup_id, decision, now(), source["id"]))
             else:
-                source_path.unlink()
-                final_decision = "deleted"
-            with transaction() as connection:
-                connection.execute(
-                    """
-                    UPDATE cleanup SET status='complete', decision=?,
-                           error=NULL, decided_at=? WHERE id=?
-                    """,
-                    (final_decision, now(), cleanup_id),
-                )
-                connection.execute(
-                    """
-                    UPDATE sources
-                       SET present=0, queue_state='removed', updated_at=?
-                     WHERE id=?
-                    """,
-                    (now(), item["source_id"]),
-                )
-                connection.execute(
-                    """
-                    UPDATE cleanup
-                       SET status='complete', decision='source_removed',
-                           decided_at=COALESCE(decided_at, ?)
-                     WHERE source_id=? AND id<>?
-                       AND status IN ('pending', 'deferred', 'error')
-                    """,
-                    (now(), item["source_id"], cleanup_id),
-                )
-            self._send_json({"ok": True, "decision": final_decision})
-        except Exception as error:
-            with transaction() as connection:
-                connection.execute(
-                    "UPDATE cleanup SET status='error', error=? WHERE id=?",
-                    (str(error)[-2000:], cleanup_id),
-                )
-            raise
+                raise ValueError("Removal requires explicit confirmation")
+        self._send_json({"ok": True, "decision": decision})
 
     def _directories(self, kind: str) -> dict:
         if kind == "movie":

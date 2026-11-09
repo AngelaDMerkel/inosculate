@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import json
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from .config import settings
 from .db import now, row, transaction
-from .discs import ffmpeg_input, playlist_stream, stream_args
+from .discs import ffmpeg_input, playlist_path, playlist_stream, stream_args
 from .media import MediaError, executable
 from .process import run_process
-from .util import json_load
+from .util import format_duration, json_load
 
 
 def _claim_preview() -> dict[str, Any] | None:
@@ -34,6 +35,37 @@ def run_sample(path: Path, title: dict, start: float, output_args: list[str]) ->
         command = [executable("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error",
                    *input_args, *output_args]
         return run_process(command, lambda *_: None, lambda: False, stdin=stream)
+
+
+def audio_sample(path: Path, title: dict, track: dict, start: float, output: Path) -> None:
+    encode = ["-t", "60", "-vn", "-c:a", "libmp3lame", "-q:a", "4", "-y", str(output)]
+    if title.get("reader") == "ffmpeg":
+        code = run_sample(path, title, start, ["-map", f"0:{track['id']}", *encode])
+    else:
+        # Use the same track ID and playlist that mkvmerge will use for the job.
+        # An FFmpeg audio ordinal can identify a different stream (e.g. a core track).
+        source = playlist_path(path, title["id"]) if title["id"].startswith("bd:") else path
+        with tempfile.TemporaryDirectory(dir=settings.work_dir) as directory:
+            clip = Path(directory) / "sample.mka"
+            command = [executable("mkvmerge"), "-o", str(clip)]
+            selection = ["--audio-tracks", str(track["id"]), "--no-video", "--no-subtitles",
+                         "--no-attachments", "--no-chapters", str(source)]
+            diagnostics = []
+            code = run_process([*command, "--split",
+                                f"parts:{format_duration(start)}-{format_duration(start + 60)}",
+                                *selection], lambda _, line: diagnostics.append(line) if "Error:" in line else None,
+                               lambda: False)
+            offset = 0
+            if code not in (0, 1) and any("cannot be split" in line for line in diagnostics):
+                # Some codecs (e.g. FLAC) cannot be split by mkvmerge. Isolate
+                # only that audio track and seek within it before encoding the sample.
+                code = run_process([*command, *selection], lambda *_: None, lambda: False)
+                offset = start
+            if code not in (0, 1) or not clip.is_file():
+                raise MediaError(f"Could not read audio track {track['id']} from {title['name']}")
+            code = run_sample(clip, {"id": "0"}, offset, ["-map", "0:a:0", *encode])
+    if code != 0 or not output.is_file() or not output.stat().st_size:
+        raise MediaError(f"Could not play audio track {track['id']}")
 
 
 def preview_once() -> bool:
@@ -78,21 +110,7 @@ def preview_once() -> bool:
             )
         else:
             output = settings.preview_dir / f"preview-{preview['id']}.mp3"
-            code = run_sample(path, title, start, [
-                "-map",
-                f"0:a:{int(track.get('ordinal', 0))}",
-                "-t",
-                "60",
-                "-vn",
-                "-c:a",
-                "libmp3lame",
-                "-q:a",
-                "4",
-                "-y",
-                str(output),
-            ])
-            if code != 0 or not output.exists() or output.stat().st_size == 0:
-                raise MediaError("FFmpeg could not create this audio preview")
+            audio_sample(path, title, track, start, output)
             result = {"kind": "audio"}
         with transaction() as connection:
             connection.execute(

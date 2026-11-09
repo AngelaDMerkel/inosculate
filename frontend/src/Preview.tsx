@@ -60,17 +60,22 @@ export default function Preview({
         <button onClick={close}>Close</button>
       </div>
       <p>
-        {draft.source.name} · {track.name || track.codec} · {track.language || "und"}
+        {draft.source.name} · {draft.title.name} · {track.type} track {track.key} ·{" "}
+        {track.name || track.codec} · {track.language || "und"}
       </p>
       {!value || ["queued", "running"].includes(value.status) ? (
-        <p role="status">Preparing sample…</p>
+        <p role="status">
+          {track.type === "audio"
+            ? "Preparing up to one minute of this audio track near the middle of the title…"
+            : "Preparing subtitle sample…"}
+        </p>
       ) : value.error ? (
         <p className="alert" role="alert">
           {value.error}
         </p>
       ) : (
         <>
-          {value.audio_url && <audio controls src={value.audio_url} />}
+          {value.audio_url && <audio controls autoPlay src={value.audio_url} />}
           {value.image_url && (
             <img alt="Frame from the selected subtitle track" src={value.image_url} />
           )}

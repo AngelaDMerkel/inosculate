@@ -20,7 +20,7 @@ def _selected_by_type(
             selected_track = dict(track)
             override = overrides.get(str(track["key"]), {})
             selected_track["language_override"] = override.get("language", "")
-            selected_track["name_override"] = override.get("name", "")
+            selected_track["name_override"] = "" if override.get("clear_name") else override.get("name") or None
             grouped[track["type"]].append(selected_track)
     return grouped
 
@@ -46,7 +46,7 @@ def _selection_options(grouped: dict[str, list[dict[str, Any]]]) -> list[str]:
                             f"{track['id']}:{track['language_override']}",
                         ]
                     )
-                if track.get("name_override"):
+                if track.get("name_override") is not None:
                     options.extend(
                         ["--track-name", f"{track['id']}:{track['name_override']}"]
                     )
@@ -97,7 +97,7 @@ def mux_command(path: Path, title: dict, keys: list[str], overrides: dict, outpu
         if track.get("codec_id") in {"pcm_dvd", "pcm_bluray"}:
             command.extend([f"-c:{index}", "pcm_s24le"])
         for field, key in [("language", "language_override"), ("title", "name_override")]:
-            if track.get(key):
+            if track.get(key) or (key == "name_override" and track.get(key) is not None):
                 command.extend([f"-metadata:s:{index}", f"{field}={track[key]}"])
     command += ["-map_chapters", chapter_input, "-f", "matroska", "-y", str(output)]
     return command, {0}, selected

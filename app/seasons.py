@@ -168,11 +168,12 @@ def season_plan(
             "season_number": source.get("season_number"),
             "episode_number": source.get("episode_number"),
             "episode_title": source.get("episode_title"),
+            "probe_status": source.get("probe_status"),
             "matched": False,
             "reason": "",
         }
         if source.get("probe_status") != "ready":
-            item["reason"] = "Track inspection is incomplete"
+            item["reason"] = source.get("probe_error") or "Track inspection is incomplete"
             planned.append(item)
             continue
         if int(source.get("active_job_count", 0) or 0):
@@ -208,11 +209,10 @@ def season_plan(
             mapped_keys.append(target_key)
             override = raw_overrides.get(template_key, {})
             if isinstance(override, dict) and (
-                override.get("language") or override.get("name")
+                override.get("language") or override.get("name") or override.get("clear_name")
             ):
                 mapped_overrides[target_key] = {
-                    "language": str(override.get("language", "")),
-                    "name": str(override.get("name", "")),
+                    field: override[field] for field in ("language", "name", "clear_name") if field in override
                 }
         if missing:
             item["reason"] = "A selected track could not be mapped"

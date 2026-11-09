@@ -37,7 +37,13 @@ export default function Jobs({
   const visible = jobs.filter(
     (j) =>
       filter === "all" ||
-      (filter === "active" ? active.includes(j.status) : j.status === "complete"),
+      (filter === "active"
+        ? active.includes(j.status)
+        : filter === "issues"
+          ? ["failed", "cancelled", "retryable", "awaiting_overwrite", "needs_selection"].includes(
+              j.status,
+            )
+          : j.status === "complete"),
   );
   return (
     <section className="page">
@@ -49,6 +55,7 @@ export default function Jobs({
         <select aria-label="Filter jobs" value={filter} onChange={(e) => setFilter(e.target.value)}>
           <option value="all">All jobs</option>
           <option value="active">Active</option>
+          <option value="issues">Needs attention</option>
           <option value="done">Completed</option>
         </select>
       </div>
@@ -72,6 +79,9 @@ export default function Jobs({
                   Job {j.id} · {j.source_name}
                 </small>
                 <h2>{j.relative_path}</h2>
+                <small>
+                  {j.output_path} · {new Date(j.started_at || j.created_at).toLocaleString()}
+                </small>
               </div>
               <span className="state">{j.status.replaceAll("_", " ")}</span>
             </header>
@@ -99,7 +109,16 @@ export default function Jobs({
                 </button>
               )}
               {j.status === "awaiting_overwrite" && (
-                <button onClick={() => action(j, "overwrite")}>Replace existing output</button>
+                <button
+                  onClick={() => {
+                    if (
+                      window.confirm("Overwrite the existing destination file?\n\n" + j.output_path)
+                    )
+                      action(j, "overwrite");
+                  }}
+                >
+                  Replace existing output
+                </button>
               )}
               <button
                 className="quiet"
