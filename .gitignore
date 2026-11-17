@@ -10,3 +10,6 @@ frontend/vite.config.d.ts
 frontend/.vite/
 data/
 .env
+image-metadata.json
+image-artifact/
+artifacts/

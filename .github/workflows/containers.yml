@@ -1,0 +1,142 @@
+name: Containers
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+# Serialize publication events, but discard superseded PR checks.
+concurrency:
+  group: containers-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Test runtime (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Validate image version and source
+        id: meta
+        run: python3 ci/image_metadata.py
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build the production image (including frontend type checks)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          push: false
+          provenance: false # Transfer a single-platform Docker archive without attestation manifests.
+          tags: inosculate:ci-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.title=Inosculate
+            org.opencontainers.image.source=${{ steps.meta.outputs.source }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.revision }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+          cache-from: type=gha,scope=runtime-${{ matrix.arch }}
+          cache-to: type=gha,scope=runtime-${{ matrix.arch }},mode=max
+      - name: Run every test and smoke check in the runtime image
+        run: bash ci/test-image.sh "inosculate:ci-$ARCH"
+        env:
+          ARCH: ${{ matrix.arch }}
+      - name: Validate Compose configuration
+        run: |
+          docker compose --env-file .env.example config --quiet
+          docker compose --env-file .env.example -f compose.yml -f compose.build.yml config --quiet
+      - name: Save the tested artifact
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p image-artifact
+          docker save "inosculate:ci-$ARCH" --output image-artifact/image.tar
+          docker image inspect "inosculate:ci-$ARCH" --format '{{.Id}}' > image-artifact/image-id.txt
+          cp image-metadata.json image-artifact/
+        env:
+          ARCH: ${{ matrix.arch }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: github.event_name != 'pull_request'
+        with:
+          name: image-${{ matrix.arch }}
+          path: image-artifact/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+  publish:
+    name: Publish tested images
+    needs: build
+    if: github.event_name == 'release' || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      reference: ${{ steps.publish.outputs.reference }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: image-*
+          path: artifacts
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the archives and report digests
+        id: publish
+        run: python3 ci/publish.py
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  public-access:
+    name: Anonymous pull (${{ matrix.arch }})
+    needs: publish
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Pull the published digest with an empty Docker configuration
+        run: |
+          mkdir -p "$DOCKER_CONFIG"
+          printf '{}\n' > "$DOCKER_CONFIG/config.json"
+          if ! docker pull --platform "linux/$ARCH" "$IMAGE"; then
+            echo '::error::Anonymous pull failed. Check GHCR package visibility (Public) and registry availability; see README maintainer setup.'
+            exit 1
+          fi
+          bash ci/test-image.sh "$IMAGE"
+          echo "Anonymous pull and runtime checks passed for linux/$ARCH: \`$IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/anonymous-docker
+          IMAGE: ${{ needs.publish.outputs.reference }}
+          ARCH: ${{ matrix.arch }}
