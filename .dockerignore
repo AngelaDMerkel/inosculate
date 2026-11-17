@@ -9,3 +9,6 @@ frontend/*.tsbuildinfo
 app/static
 .env
 stack.env
+image-metadata.json
+image-artifact
+artifacts

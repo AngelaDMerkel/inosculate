@@ -31,11 +31,12 @@ COPY app /app/app
 COPY --from=frontend-builder /app/static /app/app/static
 COPY docker-entrypoint.sh /usr/local/bin/inosculate
 RUN chmod +x /usr/local/bin/inosculate \
-    && useradd --system --uid 568 --create-home --home-dir /config inosculate \
+    && groupadd --system --gid 568 inosculate \
+    && useradd --system --uid 568 --gid 568 --create-home --home-dir /config inosculate \
     && mkdir -p /data /ingest /output/movies /output/television \
     && chown -R inosculate:inosculate /data /config
 
-USER inosculate
+USER 568:568
 EXPOSE 8787
 ENTRYPOINT ["inosculate"]
 CMD ["web"]

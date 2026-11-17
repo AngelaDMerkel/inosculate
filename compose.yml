@@ -7,8 +7,7 @@ x-media-volumes: &app-volumes
 
 services:
   web:
-    image: ${INOSCULATE_IMAGE:-inosculate:local}
-    build: .
+    image: ${INOSCULATE_IMAGE:-ghcr.io/angeladmerkel/inosculate:latest}
     command: ["web"]
     restart: unless-stopped
     ports:
@@ -28,8 +27,7 @@ services:
     volumes: *app-volumes
 
   worker:
-    image: ${INOSCULATE_IMAGE:-inosculate:local}
-    pull_policy: never
+    image: ${INOSCULATE_IMAGE:-ghcr.io/angeladmerkel/inosculate:latest}
     depends_on: [web]
     command: ["worker"]
     restart: unless-stopped
